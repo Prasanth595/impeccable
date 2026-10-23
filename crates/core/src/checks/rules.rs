@@ -81,6 +81,16 @@ impl Default for DeclaredCorners {
     }
 }
 
+/// Whether a declaration's property sets a radius: its lowercase name ends in
+/// `radius`. Corner longhands round the box, so they count; a custom property
+/// (`--btn-radius`) or a preprocessor variable (`$radius`, `@radius`) only
+/// names a value and does not.
+pub fn is_radius_property(prop: &str) -> bool {
+    !prop.starts_with("--")
+        && prop.starts_with(|c: char| c.is_ascii_alphabetic() || c == '-')
+        && prop.to_ascii_lowercase().ends_with("radius")
+}
+
 impl DeclaredCorners {
     /// Every corner at once, the way the `border-radius` shorthand sets them.
     pub fn set_all(&mut self, corners: Option<Corners>) {
@@ -547,7 +557,7 @@ fn is_styled_control(opts: &ColorOpts, bg_image: &str) -> bool {
 /// Whether `check_colors` answers from `safe_tag_text_contrast` rather than
 /// from the full pass, which is the set of findings the per-page dedupe
 /// owns.
-fn scores_safe_tag_text(opts: &ColorOpts) -> bool {
+pub(crate) fn scores_safe_tag_text(opts: &ColorOpts) -> bool {
     set_has(SAFE_TAGS, opts.tag.as_str())
         && !is_styled_control(opts, opts.bg_image.as_deref().unwrap_or(""))
 }
@@ -814,6 +824,10 @@ pub fn is_declared_purple(c: &Rgba) -> bool {
     (250.0..=320.0).contains(&hue)
 }
 
+/// The HSL saturation large non-heading text needs before its violet counts
+/// as the purple-text tell.
+const PURPLE_LARGE_TEXT_MIN_SATURATION: f64 = 0.3;
+
 /// JS: checks.mjs#checkColors
 pub fn check_colors(opts: &ColorOpts) -> Vec<RuleHit> {
     let tag = opts.tag.as_str();
@@ -842,7 +856,13 @@ pub fn check_colors(opts: &ColorOpts) -> Vec<RuleHit> {
 
         if has_chroma(Some(&text_color), Some(50.0)) {
             let hue = get_hue(Some(&text_color));
-            if hue >= 260.0 && hue <= 310.0 && (is_heading_123(tag) || opts.font_size >= 20.0) {
+            // Large type that is not a heading reports only when it reads as
+            // purple: a muted lavender-gray subtitle (v0-memorial's
+            // `#7a6699`, HSL saturation 0.2) measures violet and reads as
+            // neutral secondary text.
+            let large_and_saturated = opts.font_size >= 20.0
+                && lightness_saturation(&text_color).1 >= PURPLE_LARGE_TEXT_MIN_SATURATION;
+            if hue >= 260.0 && hue <= 310.0 && (is_heading_123(tag) || large_and_saturated) {
                 findings.push(RuleHit::new(
                     "ai-color-palette",
                     format!(
@@ -1053,7 +1073,15 @@ fn safe_tag_text_contrast(opts: &ColorOpts) -> Vec<RuleHit> {
     let Some(text_color) = opts.text_color else {
         return Vec::new();
     };
-    if resolved_bg_matches_text(opts, &text_color) {
+    // The browser engine has layout, and says whether a surface in exactly
+    // the ink's colour is one the text does not sit on
+    // (`same_color_surface_is_unread`), as the full pass asks. Where the
+    // stacks confirm the text sits on it, the `1.0:1` is real: a white link
+    // on its white card (v0-memorialqrwebsitecode-90's "Start Chat"). The
+    // static engine has no layout, and the coincidence is all it has.
+    if resolved_bg_matches_text(opts, &text_color)
+        && (!opts.detector_is_browser || opts.same_color_surface_is_unread)
+    {
         return Vec::new();
     }
     contrast_findings(opts, &text_color)
@@ -1376,6 +1404,46 @@ fn contrast_findings(opts: &ColorOpts, text_color: &Rgba) -> Vec<RuleHit> {
         }
     }
     findings
+}
+
+/// Contrast for text whose glyphs paint a gradient (`background-clip:
+/// text` under a transparent fill), against the solid `ground` the box sits
+/// on. Which stop shows under which glyph depends on the gradient's size
+/// and position, so the text is scored by the stop that reads best, and
+/// reports only where even that one fails: a pale cyan-to-violet tagline on
+/// a lavender panel (interplanetaryfund.base44.app, best stop 2.45:1). A
+/// gradient with a translucent stop, a picture layer, or no stop the parser
+/// reads is not scored, and neither is a translucent ground.
+pub fn clipped_gradient_text_contrast(bg_image: &str, ground: &Rgba, threshold: f64) -> Option<RuleHit> {
+    if ground.alpha_or_one() < 0.999 || bg_image.contains("url(") || !bg_image.contains("gradient") {
+        return None;
+    }
+    let stops = crate::color::parse_gradient_colors(Some(bg_image));
+    if stops.is_empty() || stops.iter().any(|s| s.alpha_or_one() < 0.999) {
+        return None;
+    }
+    let (best, ratio) = stops
+        .iter()
+        .map(|s| (*s, contrast_ratio(s, ground)))
+        .fold(None::<(Rgba, f64)>, |acc, cur| match acc {
+            Some(a) if a.1 >= cur.1 => Some(a),
+            _ => Some(cur),
+        })?;
+    if ratio >= threshold {
+        return None;
+    }
+    let mut hit = RuleHit::new(
+        "low-contrast",
+        format!(
+            "{}:1 (need {}:1) — gradient text, best stop {} on {}",
+            crate::color::ratio_label(ratio, threshold),
+            number_to_string(threshold),
+            color_to_hex(Some(&best)),
+            color_to_hex(Some(ground))
+        ),
+    );
+    hit.severity = contrast_severity(ratio, threshold);
+    Some(hit)
 }
 
 /// Placeholder text contrast, sibling of `check_hover_contrast`. Skips the
@@ -1940,6 +2008,23 @@ fn glow_extent_px(blur: f64, spread: f64) -> f64 {
 /// 28) is still reported.
 pub const GLOW_MIN_LIFT: f64 = 20.0;
 
+/// The HSL lightness under which a shadow colour darker than its surface is
+/// shade rather than coloured light: navy `#001d38` (0.11) under a tile on a
+/// teal band. Run 1004's judged glows on light grounds (a `#3b82f6` map
+/// marker halo, an `#ff6a28` focus glow, both 0.58 or more) read as light.
+const GLOW_SHADE_MAX_LIGHTNESS: f64 = 0.25;
+
+/// How far, in degrees of hue, a dark shadow may sit from its surface and
+/// still read as that surface's shade: navy `#001d38` (209deg) on teal
+/// (175deg) is 34deg away; rose-950 (343deg) and purple-950 (274deg) on the
+/// same teal read as coloured shadows.
+const GLOW_SHADE_MAX_HUE_DISTANCE: f64 = 50.0;
+
+fn hue_distance(a: f64, b: f64) -> f64 {
+    let d = (a - b).abs() % 360.0;
+    d.min(360.0 - d)
+}
+
 /// The share of the shadow colour's alpha a blurred shadow carries at the
 /// edge of its box.
 const GLOW_EDGE_DENSITY: f64 = 0.5;
@@ -1984,7 +2069,9 @@ pub(crate) fn glow_is_perceptible(
 }
 
 /// How far the chromatic layers of one shadow value lift `surface` at the
-/// edge of the box (see [`GLOW_MIN_LIFT`]). Neutral layers are elevation, not
+/// edge of the box (see [`GLOW_MIN_LIFT`]). A dark layer
+/// ([`GLOW_SHADE_MAX_LIGHTNESS`]) cast darker than the surface, in about its
+/// hue ([`GLOW_SHADE_MAX_HUE_DISTANCE`]), lifts nothing. Neutral layers are elevation, not
 /// glow light, and do not count, and neither does a layer carrying under half
 /// the light a glow needs ([`GLOW_MIN_STRENGTH_PX`]): Tailwind's `shadow-lg`
 /// in a 0.2 purple adds a 6px layer at 1.2px of light to its 15px one, and
@@ -1999,10 +2086,28 @@ fn glow_surface_lift(value: &str, surface: &Rgba, element_opacity: Option<f64>) 
             let color = info.color?;
             let vals = extract_shadow_lengths(layer, Some((info.start, info.end)));
             let blur = vals.get(2).copied().unwrap_or(0.0);
-            (blur * color.alpha_or_one() * opacity >= GLOW_MIN_STRENGTH_PX / 2.0).then_some(color)
+            let offset = vals.first().copied().unwrap_or(0.0) != 0.0 || vals.get(1).copied().unwrap_or(0.0) != 0.0;
+            (blur * color.alpha_or_one() * opacity >= GLOW_MIN_STRENGTH_PX / 2.0).then_some((color, offset))
         })
-        .filter(|color| has_chroma(Some(color), Some(30.0)))
-        .map(|color| {
+        .filter(|(color, _)| has_chroma(Some(color), Some(30.0)))
+        .map(|(color, offset)| {
+            // A dark shadow cast darker than its surface, in about the
+            // surface's own hue, is shade, not light: a navy drop shadow at
+            // 20% under the logo tiles on a teal band
+            // (v0-morbiawebsite.vercel.app) lifted it like a teal glow when
+            // scored as a distance. A colour bright enough to read as light
+            // keeps the distance (a blue halo on a white map still tints
+            // it), and so does a dark shadow in a hue of its own (a maroon
+            // smear on teal reads as coloured) and a zero-offset halo, which
+            // is not cast.
+            let shade = offset
+                && lightness_saturation(&color).0 < GLOW_SHADE_MAX_LIGHTNESS
+                && relative_luminance(&color) < relative_luminance(surface)
+                && has_chroma(Some(surface), Some(30.0))
+                && hue_distance(get_hue(Some(&color)), get_hue(Some(surface))) <= GLOW_SHADE_MAX_HUE_DISTANCE;
+            if shade {
+                return 0.0;
+            }
             let difference = (color.r - surface.r)
                 .abs()
                 .max((color.g - surface.g).abs())
@@ -2830,6 +2935,30 @@ mod tests {
     }
 
     #[test]
+    fn the_safe_tag_guard_asks_the_browser_engine() {
+        let white = Rgba::new(255.0, 255.0, 255.0, 1.0);
+        let opts = |browser: bool, guard: bool| ColorOpts {
+            tag: "a".to_string(),
+            text_color: Some(white),
+            effective_bg: Some(white),
+            font_size: 18.0,
+            font_weight: 500.0,
+            has_direct_text: true,
+            paints_own_text: true,
+            detector_is_browser: browser,
+            same_color_surface_is_unread: guard,
+            ..Default::default()
+        };
+        let flags = |o: &ColorOpts| check_colors(o).iter().any(|h| h.id == "low-contrast");
+        // A white link on a white card the stacks confirm: reported.
+        assert!(flags(&opts(true, false)));
+        // The surface is one the text does not sit on, or the engine has no
+        // layout to say: no verdict.
+        assert!(!flags(&opts(true, true)));
+        assert!(!flags(&opts(false, false)));
+    }
+
+    #[test]
     fn the_full_pass_guard_is_opt_in() {
         let white = Rgba::new(255.0, 255.0, 255.0, 1.0);
         let opts = |guard: bool| ColorOpts {
@@ -3018,6 +3147,44 @@ mod tests {
     }
 
     #[test]
+    fn a_shadow_darker_than_its_surface_lifts_nothing() {
+        let glow = |shadow: &str, surface: Rgba| {
+            check_glow(&GlowOpts {
+                box_shadow: Some(shadow.to_string()),
+                text_shadow: None,
+                effective_bg: Some(Rgba::new(10.0, 40.0, 50.0, 1.0)),
+                element_opacity: Some(1.0),
+                element_size: Some((160.0, 72.0)),
+                surface: Some(surface),
+            })
+        };
+        let teal = Rgba::new(13.0, 148.0, 136.0, 1.0);
+        // v0-morbiawebsite.vercel.app's navy drop shadow under pale logo
+        // tiles on a teal band (at 0.4 here, where the distance it was read
+        // as clears the lift floor): dark and darker than the band, so no
+        // light.
+        assert!(glow("rgba(0, 29, 56, 0.4) 0px 12px 28px 0px", teal).is_empty());
+        // The same blur and alpha in a light cyan lifts it.
+        assert_eq!(glow("rgba(103, 232, 249, 0.6) 0px 12px 28px 0px", teal).len(), 1);
+        // Neon on near-black is unchanged.
+        let ink = Rgba::new(10.0, 10.0, 10.0, 1.0);
+        assert_eq!(glow("rgba(0, 169, 255, 0.6) 0px 0px 24px 0px", ink).len(), 1);
+        // A blue halo on a white map tints it: bright enough to read as
+        // light, so it keeps the distance (run 1004's map markers).
+        let white = Rgba::new(255.0, 255.0, 255.0, 1.0);
+        assert_eq!(glow("rgba(59, 130, 246, 0.6) 0px 0px 24px 0px", white).len(), 1);
+        // A dark shadow in a hue of its own is a coloured shadow: rose-950
+        // and purple-950 on the teal band.
+        assert_eq!(glow("rgba(76, 5, 25, 0.9) 0px 12px 40px 0px", teal).len(), 1);
+        assert_eq!(glow("rgba(59, 7, 100, 0.9) 0px 12px 40px 0px", teal).len(), 1);
+        // A zero-offset navy halo is not cast: not shade, whatever its hue.
+        assert_eq!(glow("rgba(0, 29, 56, 0.4) 0px 0px 28px 0px", teal).len(), 1);
+        // On a neutral surface no hue says shade: the distance decides, as
+        // before.
+        assert_eq!(glow("rgba(0, 29, 56, 0.6) 0px 8px 24px 0px", white).len(), 1);
+    }
+
+    #[test]
     fn glow_needs_to_be_perceptible() {
         let glow = |shadow: &str, opacity: f64, size: Option<(f64, f64)>| {
             check_glow(&GlowOpts {
@@ -3189,6 +3356,36 @@ mod tests {
             glyph.iter().all(|h| h.id != "low-contrast" && h.id != "gray-on-color"),
             "{glyph:?}"
         );
+    }
+
+    /// observations-1004 row 24 (v0-memorial 10046886): a 20px subtitle in
+    /// a muted lavender gray (`#7a6699`, HSL saturation 0.2) is neutral
+    /// text. A saturated violet at that size, and the muted one on an h2,
+    /// keep the purple-text finding.
+    #[test]
+    fn purple_text_on_large_copy_needs_saturation() {
+        let purple = |tag: &str, ink: Rgba| {
+            check_colors(&ColorOpts {
+                tag: tag.to_string(),
+                text_color: Some(ink),
+                effective_bg: Some(Rgba::new(255.0, 255.0, 255.0, 1.0)),
+                visible_text: Some(ink),
+                font_size: 20.0,
+                font_weight: 400.0,
+                has_direct_text: true,
+                bg_clip: Some("border-box".to_string()),
+                bg_image: Some("none".to_string()),
+                ..Default::default()
+            })
+            .into_iter()
+            .filter(|h| h.id == "ai-color-palette")
+            .count()
+        };
+        let muted = Rgba::new(122.0, 102.0, 153.0, 1.0);
+        let violet = Rgba::new(124.0, 58.0, 237.0, 1.0);
+        assert_eq!(purple("p", muted), 0, "muted lavender subtitle");
+        assert_eq!(purple("p", violet), 1, "violet-600 subtitle");
+        assert_eq!(purple("h2", muted), 1, "a heading keeps its reading");
     }
 
     #[test]

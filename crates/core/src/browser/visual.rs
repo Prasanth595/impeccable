@@ -170,12 +170,23 @@ pub fn collect_visual_contrast_reasons(dom: &dyn Dom, el: ElId) -> Vec<String> {
         // surface that ends this walk: shadcn's `bg-background/95
         // backdrop-blur` sticky header. Its backdrop filter blocks nothing,
         // so it keeps the candidate under a reason no pass refuses.
+        //
+        // A fill from [`BACKDROP_NEAR_OPAQUE_ALPHA`] up shows at most a fifth
+        // of the blur, so the rendered pixels are mostly the panel's own and
+        // the pixel pass reads them as a reader does (smartbi.ca's header at
+        // 0.94, imageto3d.studio's glass tabs at 0.82). The sampled pass
+        // cannot model the blur, so it still refuses such a box, and the
+        // walk goes on past it to whatever the blur shows.
         let backdrop = dom.style(cur, "backdropFilter");
         if !backdrop.is_empty() && backdrop != "none" {
+            let near_opaque = parse_rgb_or_any(&dom.style(cur, "backgroundColor"))
+                .is_some_and(|bg| bg.alpha_or_one() >= BACKDROP_NEAR_OPAQUE_ALPHA);
             add(
                 &mut reasons,
                 if solid_bg.is_some() {
                     "backdrop filter under an opaque fill"
+                } else if near_opaque {
+                    BACKDROP_UNDER_NEAR_OPAQUE_FILL
                 } else {
                     "backdrop filter"
                 },
@@ -232,6 +243,51 @@ pub fn collect_visual_contrast_reasons(dom: &dyn Dom, el: ElId) -> Vec<String> {
         }
     }
     reasons
+}
+
+/// The fill alpha from which a box's own colour, not what its backdrop
+/// filter paints under it, is most of what the box shows: at least four
+/// fifths of every pixel.
+pub const BACKDROP_NEAR_OPAQUE_ALPHA: f64 = 0.8;
+
+/// The reason a backdrop filter under a fill from
+/// [`BACKDROP_NEAR_OPAQUE_ALPHA`] up gives: the pixel pass reads it, the
+/// sampled pass does not.
+pub const BACKDROP_UNDER_NEAR_OPAQUE_FILL: &str = "backdrop filter under a near-opaque fill";
+
+/// How far, as a WCAG ratio, every `text-shadow` layer composited over the
+/// ink has to sit from the ink for the halo to separate the glyphs from
+/// their ground ([`halo_separates_ink`]).
+pub const HALO_MIN_SEPARATION: f64 = 2.0;
+
+/// Whether every layer of `el`'s `text-shadow` stands apart from its ink:
+/// composited over the ink colour, each layer reaches
+/// [`HALO_MIN_SEPARATION`]. rhem.ai's `rgba(34, 35, 33, 0.55) 0 2px 12px`
+/// under near-white copy does, and a reader sees the copy over it. A glow in
+/// the ink's own colour (neon text), a white glow under white copy, a dark
+/// drop shadow under grey copy, a layer with no colour of its own (it takes
+/// `currentColor`) and a shadow that does not parse do not: under the glyphs
+/// such a layer is either the ink again or hidden by the glyph, and it says
+/// nothing about the ground a reader sees. The pixel pass keeps a halo in its
+/// second shot only when this holds.
+pub fn halo_separates_ink(dom: &dyn Dom, el: ElId) -> bool {
+    let Some(ink) = parse_rgb_or_any(&dom.style(el, "color")) else {
+        return false;
+    };
+    let ink = Rgba { a: Some(1.0), ..ink };
+    let shadow = dom.style(el, "textShadow");
+    let shadow = js::trim(&shadow);
+    if shadow.is_empty() || shadow == "none" {
+        return false;
+    }
+    let layers = crate::js_ext_a::split_commas_outside_parens(shadow);
+    !layers.is_empty()
+        && layers.iter().all(|layer| {
+            crate::checks::rules::find_shadow_color(layer)
+                .and_then(|info| info.color)
+                .and_then(|c| blend_rgba(Some(&c), Some(&ink)))
+                .is_some_and(|over| contrast_ratio(&ink, &over) >= HALO_MIN_SEPARATION)
+        })
 }
 
 /// Replaced boxes that paint a picture rather than a colour.
@@ -677,7 +733,7 @@ fn containing_block(dom: &dyn Dom, host: ElId) -> Option<Rect> {
 /// inside the box but may not fill it). `None` where the capture does not
 /// place it (a fixed pseudo, a size or offsets it did not resolve to pixels,
 /// a 3D transform).
-fn pseudo_box(dom: &dyn Dom, node: ElId, which: &str) -> Option<(Rect, bool)> {
+pub(crate) fn pseudo_box(dom: &dyn Dom, node: ElId, which: &str) -> Option<(Rect, bool)> {
     let get = |prop: &str| dom.pseudo_style(node, which, prop).unwrap_or_default();
     if js::trim(&get("position")) != "absolute" {
         return None;
@@ -1909,6 +1965,13 @@ pub fn collect_visual_contrast_candidates(dom: &dyn Dom, options: &Value) -> Vec
     let root = dom.document_element();
     let mut candidates: Vec<Value> = Vec::new();
     let mut routed: Vec<Value> = Vec::new();
+    // A routed candidate that repeats one already taken (the same ink, size,
+    // weight and class: the third of four identical photo cards) waits
+    // until the document is read, and takes a slot only where distinct text
+    // left one free. The slots go to text that differs first; each copy
+    // still reports its own verdict when it is read.
+    let mut routed_keys: Vec<String> = Vec::new();
+    let mut repeats: Vec<Value> = Vec::new();
     for el in dom.query_all(None, "*").unwrap_or_default() {
         let base_open = (candidates.len() as f64) < max_candidates;
         let routed_open = (routed.len() as f64) < max_routed;
@@ -1955,12 +2018,36 @@ pub fn collect_visual_contrast_candidates(dom: &dyn Dom, options: &Value) -> Vec
         }
         if routed_open {
             if let Some(c) = routed_candidate(dom, el, &tag, &direct) {
-                routed.push(c);
+                let key = routed_repeat_key(dom, el);
+                if routed_keys.contains(&key) {
+                    if (repeats.len() as f64) < max_routed {
+                        repeats.push(c);
+                    }
+                } else {
+                    routed_keys.push(key);
+                    routed.push(c);
+                }
             }
         }
     }
+    let free = (max_routed as usize).saturating_sub(routed.len());
+    routed.extend(repeats.into_iter().take(free));
     candidates.extend(routed);
     candidates
+}
+
+/// What makes two routed candidates copies of one design: the ink, the
+/// font size and weight, the tag and the class list.
+fn routed_repeat_key(dom: &dyn Dom, el: ElId) -> String {
+    let ink = dom.text_slot(el).unwrap_or(el);
+    format!(
+        "{}|{}|{}|{}|{}",
+        tag_lower(dom, el),
+        dom.style(ink, "color"),
+        dom.style(ink, "fontSize"),
+        dom.style(ink, "fontWeight"),
+        dom.attr(el, "class").unwrap_or_default()
+    )
 }
 
 /// The first budget's candidate for `el`, exactly as the collector has always
@@ -2083,6 +2170,34 @@ pub fn routed_reason(dom: &dyn Dom, el: ElId) -> Option<&'static str> {
         .then_some("unread layer")
 }
 
+re!(HANDED_VERDICT_RE, r"^[0-9.]+:1 \(need ([0-9.]+):1\) — text (#[0-9a-fA-F]{3,8}) on #[0-9a-fA-F]{3,8}(?: \([^()]*\))?$".to_string());
+
+/// The text a handed-over `low-contrast` verdict on `el` keeps when the
+/// pixels give it none (`settle_handed_over` in the URL engine), where the
+/// structural climb found a picture, or paint it cannot model, under the
+/// run. The element pass's ratio there is against the walk's ground, which
+/// the picture covers, so it measured nothing a reader sees: printed, it
+/// gave white copy over product photos `1.1:1 — text #fcfcfc on #efefef`
+/// (v0-amber-flax.vercel.app). The ink and the bar stay; the ratio and the
+/// ground go. `None` keeps the verdict's text: outlined text, any other
+/// layer, or a verdict not in the element pass's plain form.
+pub fn unmeasured_handed_over_snippet(dom: &dyn Dom, el: ElId, snippet: &str) -> Option<String> {
+    let caps = HANDED_VERDICT_RE.captures(snippet)?;
+    if snippet.ends_with(')') && snippet.contains(" (layer on ") {
+        return None;
+    }
+    let ink = dom.text_slot(el).unwrap_or(el);
+    if text_outlined(dom, ink) {
+        return None;
+    }
+    let over = match layer_under_text_found(dom, el).0 {
+        LayerUnder::Picture => "over an image",
+        LayerUnder::Unmodelled => "over paint the scan could not read",
+        _ => return None,
+    };
+    Some(format!("text {} {over}, not measured (need {}:1)", &caps[2], &caps[1]))
+}
+
 /// The second budget's candidate for `el` ([`routed_reason`]), past the
 /// same text gates as the first.
 fn routed_candidate(dom: &dyn Dom, el: ElId, tag: &str, direct: &str) -> Option<Value> {
@@ -2151,6 +2266,7 @@ fn candidate_value(dom: &dyn Dom, el: ElId, tag: &str, direct: &str, rect: &Rect
                     | "blend mode"
                     | "filter"
                     | "backdrop filter"
+                    | BACKDROP_UNDER_NEAR_OPAQUE_FILL
                     | "background-clip text"
                     | "text outline"
             )
@@ -2175,6 +2291,11 @@ fn candidate_value(dom: &dyn Dom, el: ElId, tag: &str, direct: &str, rect: &Rect
     // pass; the key is only written when it holds.
     if super::decorative_text::is_decorative_text_dom(dom, el) {
         m.insert("decorative".into(), Value::Bool(true));
+    }
+    // A halo that separates the glyphs from their ground may stay in the
+    // pixel pass's second shot; the key is only written when it holds.
+    if reasons.iter().any(|r| r == "text shadow") && halo_separates_ink(dom, el) {
+        m.insert("haloSeparates".into(), Value::Bool(true));
     }
     if let Some(identity) = identity {
         m.insert("match".into(), identity);
@@ -2822,6 +2943,21 @@ fn gradient_layer_covers_box(dom: &dyn Dom, node: ElId, layers: &[String], index
 /// JS: index.mjs#sampleCssBackground — every decision except the image
 /// load and the canvas sample.
 pub fn css_plan(dom: &dyn Dom, node: ElId, text_color: Option<&Rgba>) -> CssPlan {
+    // A box whose background is clipped to its text paints it inside its
+    // own glyphs only: it is no surface for the text of the box that holds
+    // it (freesubtitlemaker.lovable.app's gradient word inside a white h1
+    // was read as the h1's ground, 2.5:1). The walk goes on beneath it. The
+    // candidate's own clipped text is refused before the walk
+    // (`background-clip text`).
+    let bg_clip = {
+        let a = dom.style(node, "webkitBackgroundClip");
+        if a.is_empty() { dom.style(node, "backgroundClip") } else { a }
+    };
+    if crate::checks::rules::background_clips_to_text(&bg_clip) {
+        return CssPlan::Sample {
+            sample: json!({ "status": "unresolved", "reason": "no readable background" }),
+        };
+    }
     let bg_image = dom.style(node, "backgroundImage");
     if !bg_image.is_empty() && bg_image != "none" {
         if GRADIENT_RE.is_match(&bg_image) {
@@ -3122,8 +3258,45 @@ fn placed_size_is_known(size: &str, intrinsic_w: f64, intrinsic_h: f64) -> bool 
 }
 
 /// JS: `{ ...sample, method: 'canvas-background-image' }` when sampled.
-pub fn css_url_finish(sample: Value) -> Value {
-    with_method(sample, "canvas-background-image")
+///
+/// A box paints its `background-color` beneath its image layers, so a
+/// translucent pixel of the image is laid over that fill before the walk
+/// goes on: resineda.com's grain tile over its near-black hero section was
+/// composited over the cream page beneath the section instead, and printed
+/// 1.2:1 for its near-white title. The result is opaque where the fill is,
+/// and still translucent (the two layers composited) where it is not.
+/// Only a box with one image layer: with more, the layers under the sampled
+/// one lie between it and the fill, and the sample is returned as before.
+pub fn css_url_finish(dom: &dyn Dom, node: ElId, sample: Value) -> Value {
+    let sample = with_method(sample, "canvas-background-image");
+    if sample.get("status").and_then(Value::as_str) != Some("sampled") || sample_is_opaque(&sample) {
+        return sample;
+    }
+    if split_top_level_commas(&dom.style(node, "backgroundImage")).len() > 1 {
+        return sample;
+    }
+    let Some(fill) = parse_rgb_or_any(&dom.style(node, "backgroundColor")) else { return sample };
+    let fill_alpha = fill.alpha_or_one();
+    if !(fill_alpha > MIN_PAINTED_ALPHA) {
+        return sample;
+    }
+    let Some(top) = rgba_from_value(sample.get("color")) else { return sample };
+    let top_alpha = math_max(0.0, math_min(1.0, top.alpha_or_one()));
+    let alpha = top_alpha + fill_alpha * (1.0 - top_alpha);
+    if alpha <= 0.0 {
+        return sample;
+    }
+    let mix = |t: f64, f: f64| clamp_byte((t * top_alpha + f * fill_alpha * (1.0 - top_alpha)) / alpha);
+    let color = Rgba {
+        r: mix(top.r, fill.r),
+        g: mix(top.g, fill.g),
+        b: mix(top.b, fill.b),
+        a: Some(if alpha >= 0.999 { 1.0 } else { alpha }),
+    };
+    let mut m = sample.as_object().cloned().unwrap_or_default();
+    m.insert("color".into(), rgba_value(Some(&color)));
+    m.insert("method".into(), Value::String("canvas-background-image+fill".into()));
+    Value::Object(m)
 }
 
 /// JS: `!sample.color || sample.color.a == null || sample.color.a >= 0.95` —
@@ -3259,6 +3432,7 @@ pub fn prepare_analysis(dom: &dyn Dom, candidate: &Value) -> Prepared {
                 | "blend mode"
                 | "filter"
                 | "backdrop filter"
+                | BACKDROP_UNDER_NEAR_OPAQUE_FILL
                 | "opacity stack"
                 | "text shadow"
                 | "unread layer"
@@ -3521,6 +3695,9 @@ const GLYPH_BODY_COVERAGE: f64 = 0.75;
 /// page repainted between the two screenshots (a video, a carousel, a reveal
 /// animation) and no pixel pair is a glyph over its background.
 const GLYPH_CHURN_SHARE: f64 = 0.55;
+/// The reason [`pixel_contrast_verdict`] gives where most of the clip
+/// changed between the two shots.
+pub const BOX_REPAINTED: &str = "box repainted between captures";
 /// Hiding text moves every pixel it painted the same way: toward the surface
 /// under it. A box where a large minority moved the other way holds something
 /// that arrived or left between the captures — text mid-animation leaves its
@@ -3579,7 +3756,7 @@ pub fn pixel_contrast_verdict(
         return PixelContrastOutcome::Unresolved("too few glyph pixels");
     }
     if clip_pixels > 0 && pixels.len() as f64 > clip_pixels as f64 * GLYPH_CHURN_SHARE {
-        return PixelContrastOutcome::Unresolved("box repainted between captures");
+        return PixelContrastOutcome::Unresolved(BOX_REPAINTED);
     }
     let darkened = pixels.iter().filter(|p| p.darkened).count();
     let minority = darkened.min(pixels.len() - darkened);
@@ -3899,6 +4076,74 @@ mod tests {
         d.set_styles(header, &[("backgroundColor", "rgb(0, 0, 0)"), ("backdropFilter", "none"), ("display", "contents")]);
         let reasons = collect_visual_contrast_reasons(&d, p);
         assert!(reasons.iter().any(|r| r == "image background"), "{reasons:?}");
+    }
+
+    /// A halo is kept for the pixels' second reading only where every layer
+    /// stands apart from the ink: rhem.ai's dark halo under near-white copy,
+    /// not a neon glow in the ink's colour or a drop shadow under grey copy.
+    #[test]
+    fn a_halo_separates_ink_only_when_every_layer_stands_apart() {
+        let mut d = FakeDom::new();
+        let (_html, body) = d.with_page();
+        let p = d.add(Some(body), "p");
+        let halo = |d: &mut FakeDom, ink: &str, shadow: &str| {
+            d.set_styles(p, &[("color", ink), ("textShadow", shadow)]);
+            halo_separates_ink(d, p)
+        };
+        assert!(halo(&mut d, "rgb(251, 250, 248)", "rgba(34, 35, 33, 0.55) 0px 2px 12px"));
+        assert!(halo(&mut d, "rgb(255, 255, 255)", "rgba(0, 0, 0, 0.624) 0px 0px 10px"));
+        assert!(!halo(
+            &mut d,
+            "rgb(244, 114, 182)",
+            "rgb(244, 114, 182) 0px 0px 4px, rgb(244, 114, 182) 0px 0px 10px, rgb(219, 39, 119) 0px 0px 20px"
+        ));
+        assert!(!halo(&mut d, "rgb(117, 117, 117)", "rgba(0, 0, 0, 0.3) 0px 2px 4px"));
+        assert!(!halo(&mut d, "rgb(255, 255, 255)", "rgba(255, 255, 255, 0.9) 0px 0px 8px"));
+        // One layer in the ink's colour is enough to keep the halo hidden.
+        assert!(!halo(&mut d, "rgb(255, 255, 255)", "rgba(0, 0, 0, 0.6) 0px 0px 10px, rgb(255, 255, 255) 0px 0px 2px"));
+        assert!(!halo(&mut d, "rgb(255, 255, 255)", "none"));
+    }
+
+    /// smartbi.ca's header (`rgba(18, 36, 44, 0.94)` with `blur(12px)`) and
+    /// imageto3d.studio's glass tabs (0.82 with `blur(24px)` over a photo):
+    /// the panel's own fill is most of every pixel, so the pixels read the
+    /// text, and the sampled pass, which cannot model the blur, does not.
+    #[test]
+    fn a_backdrop_filter_under_a_near_opaque_fill_is_read_by_the_pixels() {
+        let mut d = FakeDom::new();
+        let (_html, body) = d.with_page();
+        let wrap = d.add(Some(body), "div");
+        d.set_style(wrap, "backgroundImage", "url(\"/hero.jpg\")");
+        let header = d.add(Some(wrap), "header");
+        d.set_styles(header, &[("backgroundColor", "rgba(18, 36, 44, 0.94)"), ("backdropFilter", "blur(12px)")]);
+        let p = d.add(Some(header), "p");
+        d.add_text(p, "FR");
+        d.set_styles(p, &[("backgroundColor", "rgba(0, 0, 0, 0)"), ("color", "rgba(255, 255, 255, 0.4)"), ("fontSize", "13px")]);
+        d.set_rect(p, 10.0, 10.0, 40.0, 16.0);
+        for alpha in ["0.94", "0.82", "0.8"] {
+            d.set_style(header, "backgroundColor", &format!("rgba(18, 36, 44, {alpha})"));
+            let reasons = collect_visual_contrast_reasons(&d, p);
+            assert!(reasons.iter().any(|r| r == BACKDROP_UNDER_NEAR_OPAQUE_FILL), "{alpha}: {reasons:?}");
+            // The walk goes on to the photo the blur shows.
+            assert!(reasons.iter().any(|r| r == "image background"), "{alpha}: {reasons:?}");
+            assert!(pixel_contrast_blocked(&reasons).is_none(), "{alpha}: {reasons:?}");
+            let candidate = json!({ "selector": "p", "reasons": reasons });
+            match prepare_analysis(&d, &candidate) {
+                Prepared::Early { early } => assert_eq!(
+                    early["reason"],
+                    format!("{BACKDROP_UNDER_NEAR_OPAQUE_FILL} needs screenshot pixels"),
+                    "{alpha}"
+                ),
+                other => panic!("{alpha}: {other:?}"),
+            }
+        }
+        // Under four fifths the blur is too much of what shows.
+        d.set_style(header, "backgroundColor", "rgba(18, 36, 44, 0.79)");
+        let reasons = collect_visual_contrast_reasons(&d, p);
+        assert_eq!(pixel_contrast_blocked(&reasons).as_deref(), Some("backdrop filter"), "{reasons:?}");
+        d.set_style(header, "backgroundColor", "rgba(0, 0, 0, 0)");
+        let reasons = collect_visual_contrast_reasons(&d, p);
+        assert_eq!(pixel_contrast_blocked(&reasons).as_deref(), Some("backdrop filter"), "{reasons:?}");
     }
 
     #[test]
@@ -4582,6 +4827,153 @@ mod tests {
         assert!(both[1]["reasons"].as_array().unwrap().contains(&json!("unread layer")));
         let none = collect_visual_contrast_candidates(&d, &json!({ "maxCandidates": 12, "maxRoutedCandidates": 0 }));
         assert_eq!(none, first);
+    }
+
+    /// Four photo cards with one caption design: the second budget reads
+    /// each design once before it reads a copy.
+    #[test]
+    fn the_second_budget_reads_each_design_before_its_copies() {
+        let mut d = FakeDom::new();
+        let (html, body) = d.with_page();
+        d.set_rect(html, 0.0, 0.0, 1280.0, 4000.0);
+        d.set_rect(body, 0.0, 0.0, 1280.0, 4000.0);
+        d.set_style(body, "backgroundColor", "rgb(255, 255, 255)");
+        let card = |d: &mut FakeDom, y: f64, text: &str, class: &str| {
+            let hero = d.add(Some(body), "section");
+            d.set_rect(hero, 0.0, y, 1280.0, 300.0);
+            d.set_styles(hero, &[("position", "relative"), ("backgroundColor", "rgba(0, 0, 0, 0)"), ("opacity", "1")]);
+            let photo = d.add(Some(hero), "img");
+            d.set_rect(photo, 0.0, y, 1280.0, 300.0);
+            d.set_styles(photo, &[("position", "absolute"), ("opacity", "1")]);
+            let content = d.add(Some(hero), "div");
+            d.set_rect(content, 0.0, y + 100.0, 1280.0, 100.0);
+            d.set_styles(content, &[("position", "relative"), ("backgroundColor", "rgba(0, 0, 0, 0)"), ("opacity", "1")]);
+            let a = text_run(d, content, "a", text, (20.0, y + 120.0, 140.0, 20.0));
+            d.set_attr(a, "class", class);
+            a
+        };
+        for i in 0..4 {
+            card(&mut d, 400.0 * i as f64, &format!("Product {i}"), "card-title");
+        }
+        card(&mut d, 1600.0, "Read the story", "story-link");
+        let texts = |max: u32| -> Vec<String> {
+            collect_visual_contrast_candidates(&d, &json!({ "maxCandidates": 0, "maxRoutedCandidates": max }))
+                .iter()
+                .map(|c| c["text"].as_str().unwrap_or("").to_string())
+                .collect()
+        };
+        // Two slots: one card, then the other design, not a second card.
+        assert_eq!(texts(2), ["Product 0", "Read the story"]);
+        // Slots to spare go to the copies, in order.
+        assert_eq!(texts(4), ["Product 0", "Read the story", "Product 1", "Product 2"]);
+        assert_eq!(texts(12).len(), 5);
+    }
+
+    /// v0-amber-flax.vercel.app: white copy on product photos, handed to the
+    /// pixels. Where they give no verdict, the ratio against the page ground
+    /// the walk read is not printed.
+    #[test]
+    fn a_handed_over_verdict_over_a_picture_is_not_measured() {
+        let mut d = FakeDom::new();
+        let (html, body) = d.with_page();
+        d.set_rect(html, 0.0, 0.0, 1280.0, 4000.0);
+        d.set_rect(body, 0.0, 0.0, 1280.0, 4000.0);
+        d.set_style(body, "backgroundColor", "rgb(239, 239, 239)");
+        let hero = d.add(Some(body), "section");
+        d.set_rect(hero, 0.0, 1200.0, 1280.0, 600.0);
+        d.set_styles(hero, &[("position", "relative"), ("backgroundColor", "rgba(0, 0, 0, 0)"), ("opacity", "1")]);
+        let photo = d.add(Some(hero), "img");
+        d.set_rect(photo, 0.0, 1200.0, 1280.0, 600.0);
+        d.set_styles(photo, &[("position", "absolute"), ("opacity", "1")]);
+        let content = d.add(Some(hero), "div");
+        d.set_rect(content, 0.0, 1400.0, 1280.0, 100.0);
+        d.set_styles(content, &[("position", "relative"), ("backgroundColor", "rgba(0, 0, 0, 0)"), ("opacity", "1")]);
+        let p = text_run(&mut d, content, "p", "Shop the edit", (20.0, 1420.0, 140.0, 20.0));
+        assert_eq!(
+            unmeasured_handed_over_snippet(&d, p, "1.1:1 (need 4.5:1) — text #fcfcfc on #efefef").as_deref(),
+            Some("text #fcfcfc over an image, not measured (need 4.5:1)")
+        );
+        assert_eq!(
+            unmeasured_handed_over_snippet(&d, p, "3.4:1 (need 4.5:1) — text #ffffff on #8b8b8b (gradient on div.card)").as_deref(),
+            Some("text #ffffff over an image, not measured (need 4.5:1)")
+        );
+        // A verdict already printed against the paint keeps its text.
+        assert!(unmeasured_handed_over_snippet(&d, p, "2.0:1 (need 4.5:1) — text #fcfcfc on #222222 (layer on img)").is_none());
+        assert!(unmeasured_handed_over_snippet(&d, p, "not a verdict").is_none());
+        // Outlined text keeps its own verdict.
+        d.set_styles(p, &[("webkitTextStrokeWidth", "2px"), ("webkitTextStrokeColor", "rgb(0, 0, 0)")]);
+        assert!(unmeasured_handed_over_snippet(&d, p, "1.1:1 (need 4.5:1) — text #fcfcfc on #efefef").is_none());
+        // Text over its own section's fill was never over a picture.
+        let plain = text_run(&mut d, body, "p", "Plain", (20.0, 100.0, 140.0, 20.0));
+        assert!(unmeasured_handed_over_snippet(&d, plain, "1.1:1 (need 4.5:1) — text #fcfcfc on #efefef").is_none());
+    }
+
+    /// freesubtitlemaker.lovable.app: a gradient word inside a white h1.
+    #[test]
+    fn a_background_clipped_to_text_is_no_surface() {
+        let mut d = FakeDom::new();
+        let (_, body) = d.with_page();
+        let word = d.add(Some(body), "span");
+        d.set_styles(
+            word,
+            &[
+                ("backgroundImage", "linear-gradient(135deg, rgb(99, 102, 241), rgb(168, 85, 247))"),
+                ("backgroundColor", "rgba(0, 0, 0, 0)"),
+                ("backgroundClip", "text"),
+                ("webkitBackgroundClip", "text"),
+            ],
+        );
+        let white = rgba(255.0, 255.0, 255.0, 1.0);
+        match css_plan(&d, word, Some(&white)) {
+            CssPlan::Sample { sample } => {
+                assert_eq!(sample["status"], "unresolved");
+                assert!(!sample_ends_walk(&sample), "the walk goes on beneath it");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Clipped to its padding box it paints a surface, as before.
+        d.set_styles(word, &[("backgroundClip", "padding-box"), ("webkitBackgroundClip", "padding-box")]);
+        match css_plan(&d, word, Some(&white)) {
+            CssPlan::Sample { sample } => assert_eq!(sample["status"], "sampled"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// resineda.com: a translucent grain tile on a near-black section.
+    #[test]
+    fn a_translucent_image_pixel_lies_over_its_own_fill() {
+        let mut d = FakeDom::new();
+        let (_, body) = d.with_page();
+        let section = d.add(Some(body), "section");
+        d.set_style(section, "backgroundColor", "rgb(17, 17, 17)");
+        d.set_style(section, "backgroundImage", "url(\"grain.png\")");
+        let pixel = json!({ "status": "sampled", "color": { "r": 255.0, "g": 255.0, "b": 255.0, "a": 0.1 } });
+        let out = css_url_finish(&d, section, pixel.clone());
+        assert!(sample_is_opaque(&out), "{out}");
+        let c = rgba_from_value(out.get("color")).unwrap();
+        assert_eq!((c.r, c.g, c.b), (41.0, 41.0, 41.0));
+        assert_eq!(out["method"], "canvas-background-image+fill");
+        // Over a translucent fill the two composite and the walk goes on.
+        d.set_style(section, "backgroundColor", "rgba(0, 0, 0, 0.5)");
+        let out = css_url_finish(&d, section, pixel.clone());
+        assert!(!sample_is_opaque(&out), "{out}");
+        assert!((out["color"]["a"].as_f64().unwrap() - 0.55).abs() < 1e-9, "{out}");
+        // No fill: the pixel as sampled.
+        d.set_style(section, "backgroundColor", "rgba(0, 0, 0, 0)");
+        let out = css_url_finish(&d, section, pixel.clone());
+        assert_eq!(out["color"]["a"], 0.1);
+        assert_eq!(out["method"], "canvas-background-image");
+        // An opaque pixel hides the fill.
+        d.set_style(section, "backgroundColor", "rgb(17, 17, 17)");
+        let solid = json!({ "status": "sampled", "color": { "r": 250.0, "g": 250.0, "b": 250.0, "a": 1.0 } });
+        assert_eq!(css_url_finish(&d, section, solid)["color"]["r"], 250.0);
+        // A photo beneath the grain lies between the pixel and the fill: the
+        // pixel is returned as sampled, not laid over a white fallback.
+        d.set_style(section, "backgroundColor", "rgb(255, 255, 255)");
+        d.set_style(section, "backgroundImage", "url(\"grain.png\"), url(\"photo.jpg\")");
+        let out = css_url_finish(&d, section, pixel.clone());
+        assert_eq!(out["color"]["a"], 0.1, "{out}");
+        assert_eq!(out["method"], "canvas-background-image");
     }
 
     /// fischundfang.de marks its whole page wrapper `aria-hidden="true"`.

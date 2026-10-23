@@ -108,6 +108,9 @@ async function exercise(t, scenario) {
     fs.writeFileSync(launcher, source.replace(operation, replacement));
   }
   const requests = [];
+  const interrupt = scenario.startsWith('interrupt-') ? scenario.slice('interrupt-'.length) : null;
+  let stalled;
+  const stall = new Promise(resolve => { stalled = resolve; });
   const server = http.createServer((req, res) => {
     requests.push(req.url);
     if (scenario === 'transport-failure') {
@@ -121,6 +124,12 @@ async function exercise(t, scenario) {
       res.writeHead(scenario === 'no-sidecar' ? 404 : 200);
       res.end(scenario === 'empty-sidecar' ? '' : `${scenario === 'mismatch' ? '0'.repeat(64) : HASH}  engine\n`);
     } else {
+      if (interrupt) {
+        // Send part of the body and never finish, so the launcher is mid-download.
+        res.writeHead(200);
+        res.write(PAYLOAD.subarray(0, 8), stalled);
+        return;
+      }
       if (scenario === 'download-failure') res.writeHead(404);
       res.end(scenario === 'empty-download' ? '' : PAYLOAD);
     }
@@ -139,7 +148,9 @@ async function exercise(t, scenario) {
   const run = () => new Promise((resolve, reject) => {
     const child = WINDOWS
       ? spawn(COMSPEC, ['/d', '/s', '/c', `""${launcher}" /d /c echo verified-engine"`], { env, cwd: root, windowsVerbatimArguments: true, timeout: 20000 })
-      : spawn('/bin/sh', [launcher], { env, cwd: root, timeout: 20000 });
+      : spawn('/bin/sh', [launcher], { env, cwd: root, timeout: 20000, detached: Boolean(interrupt) });
+    // Signal the whole process group, as Ctrl-C or GNU timeout would.
+    if (interrupt) stall.then(() => process.kill(-child.pid, interrupt));
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', data => { stdout += data; });
@@ -209,6 +220,12 @@ test('cmd launcher stages each run under its own name', () => {
   assert.match(source, /mkdir "%staging%" >nul 2>nul\r?\nif errorlevel 1 goto claim_staging/);
 });
 
+test('cmd launcher is checked out with CRLF line endings', () => {
+  const source = fs.readFileSync(path.join(ROOT, 'skill/scripts/impeccable.cmd'));
+  const withoutCrlf = Buffer.from(source.toString('binary').replaceAll('\r\n', ''));
+  assert.equal(withoutCrlf.includes(10), false, 'cmd.exe batch labels require CRLF line endings');
+});
+
 test('cmd launcher forwards engine exit code through cmd /c', { skip: WINDOWS ? false : 'Windows-only cmd /c exit-code forwarding' }, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'impeccable-launcher-exit-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -257,5 +274,13 @@ for (const scenario of ['removed', 'emptied', 'empty-download', 'no-sidecar', 'e
     } else {
       assert.match(result.stderr, /refusing the unverified download/);
     }
+  });
+}
+
+for (const [signal, status] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+  test(`launcher removes its partial download when interrupted by ${signal}`, { skip: WINDOWS ? 'POSIX launcher only; the cmd launcher stages in its own directory' : false }, async t => {
+    const result = await exercise(t, `interrupt-${signal}`);
+    assert.equal(result.status, status, JSON.stringify(result));
+    assert.deepEqual(result.files, [], 'no staging file left behind');
   });
 }

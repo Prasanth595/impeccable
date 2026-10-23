@@ -31,6 +31,18 @@ re!(
     SVG_BLOCK_RE,
     format!(r"<{svg}{B}[^>]*>{ANY}*?</{svg}>", svg = ci("svg"))
 );
+// Shapes inside `<defs>` are assets, drawn only where something references
+// them, so they count toward neither the primitives nor the drawn shapes.
+re!(
+    SVG_DEFS_RE,
+    format!(r"<{defs}{B}[^>]*>{ANY}*?</{defs}>", defs = ci("defs"))
+);
+re!(SVG_USE_RE, format!(r"<{}{B}", ci("use")));
+re!(SVG_ID_RE, r#"(?i)\sid\s*=\s*["']([^"']+)["']"#.to_string());
+re!(
+    SVG_USE_HREF_RE,
+    r#"(?i)<use\b[^>]*?\bhref\s*=\s*["']#([^"']+)["']"#.to_string()
+);
 re!(SVG_OPEN_RE, format!(r"^<{svg}{B}[^>]*>", svg = ci("svg")));
 re!(
     SVG_TEXT_RE,
@@ -82,6 +94,48 @@ re!(
     )
 );
 
+re!(
+    SVG_WIDTH_FONT_RE,
+    format!(
+        r#"{w}{WS}*={WS}*["']{WS}*([0-9.]+)({em}|{rem}){WS}*["']"#,
+        w = ci("width"),
+        em = ci("em"),
+        rem = ci("rem")
+    )
+);
+re!(
+    SVG_HEIGHT_FONT_RE,
+    format!(
+        r#"{h}{WS}*={WS}*["']{WS}*([0-9.]+)({em}|{rem}){WS}*["']"#,
+        h = ci("height"),
+        em = ci("em"),
+        rem = ci("rem")
+    )
+);
+re!(
+    SVG_DRAWN_SHAPE_RE,
+    format!(
+        r"<(?:{rect}|{circle}|{ellipse}|{polygon}|{path}|{line}|{polyline}){B}",
+        rect = ci("rect"),
+        circle = ci("circle"),
+        ellipse = ci("ellipse"),
+        polygon = ci("polygon"),
+        path = ci("path"),
+        line = ci("line"),
+        polyline = ci("polyline")
+    )
+);
+
+/// The font size an `em` or `rem` SVG size is read against: the browser
+/// default, since the source does not say what the SVG inherits.
+const SVG_FONT_SIZE_PX: f64 = 16.0;
+
+/// The share of an SVG's drawn shapes that must be primitives (rect, circle,
+/// ellipse, polygon) before it reads as a scene assembled from them. A logo
+/// or a traced drawing is paths with a few primitives among them (nic.sa's
+/// wordmark: 11 of 208).
+const SVG_PRIMITIVE_SHARE_MIN: f64 = 0.25;
+
 /// JS `attrDim(name)`: first `name="<num>"` in the open tag whose match is
 /// not preceded by `[-\w]` (the lookbehind keeps `stroke-width` out).
 fn svg_attr_dim(open_tag: &str, re: &Regex) -> Option<f64> {
@@ -112,14 +166,50 @@ pub fn scan_html_for_shape_assembled_illustration(html: &str) -> Vec<RuleHit> {
         if SVG_PATTERN_RE.is_match(block) {
             continue;
         }
-        let primitives = SVG_PRIMITIVE_RE.find_iter(block).count();
+        // Without a `<use>` to repeat a shape, defs only lower the count, so
+        // a block short of eight primitives needs no further work.
+        let has_use = SVG_USE_RE.is_match(block);
+        if !has_use && SVG_PRIMITIVE_RE.find_iter(block).count() < 8 {
+            continue;
+        }
+        // Shapes in `<defs>` are assets: they are drawn only through a
+        // `<use>` that names them, once per use.
+        let painted = SVG_DEFS_RE.replace_all(block, "");
+        let mut primitives = SVG_PRIMITIVE_RE.find_iter(&painted).count();
+        let mut drawn = SVG_DRAWN_SHAPE_RE.find_iter(&painted).count();
+        if has_use {
+            let mut assets: Vec<(String, bool)> = Vec::new();
+            for d in SVG_DEFS_RE.find_iter(block) {
+                for shape in SVG_DRAWN_SHAPE_RE.find_iter(d.as_str()) {
+                    let rest = &d.as_str()[shape.start()..];
+                    let tag = &rest[..rest.find('>').unwrap_or(rest.len())];
+                    if let Some(id) = SVG_ID_RE.captures(tag) {
+                        assets.push((id[1].to_string(), SVG_PRIMITIVE_RE.is_match(tag)));
+                    }
+                }
+            }
+            for u in SVG_USE_HREF_RE.captures_iter(block) {
+                if let Some((_, primitive)) = assets.iter().find(|(id, _)| *id == u[1]) {
+                    drawn += 1;
+                    primitives += usize::from(*primitive);
+                }
+            }
+        }
         if primitives < 8 {
             continue;
         }
+        if (primitives as f64) < drawn as f64 * SVG_PRIMITIVE_SHARE_MIN {
+            continue;
+        }
         let vb = SVG_VIEWBOX_RE.captures(open_tag);
+        // A size in `em` or `rem` is set at the text's scale (an inline
+        // logo at `width="4.33em"`), not at the viewBox's.
+        let font_dim = |re: &Regex| svg_attr_dim(open_tag, re).map(|v| v * SVG_FONT_SIZE_PX);
         let w = svg_attr_dim(open_tag, &SVG_WIDTH_RE)
+            .or_else(|| font_dim(&SVG_WIDTH_FONT_RE))
             .or_else(|| vb.as_ref().map(|v| parse_float(&v[1])));
         let h = svg_attr_dim(open_tag, &SVG_HEIGHT_RE)
+            .or_else(|| font_dim(&SVG_HEIGHT_FONT_RE))
             .or_else(|| vb.as_ref().map(|v| parse_float(&v[2])));
         let (w, h) = match (w, h) {
             (Some(w), Some(h)) => (w, h),
@@ -497,6 +587,32 @@ pub struct PatternContext {
     pub dark_page: Option<bool>,
 }
 
+/// How many candidates a one-candidate rule offers the `stands` gate of
+/// [`check_html_patterns_picking`] before it reports none.
+pub const PICK_MAX_CANDIDATES: usize = 16;
+
+static CUSTOM_PROP_DECL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(--[A-Za-z0-9_-]+)\s*:\s*$").expect("CUSTOM_PROP_DECL_RE"));
+
+/// Whether the curve at `index` is the whole value of a custom property
+/// that no `var()` in the style text reads. incredible.one defines
+/// `--ease-bounce: cubic-bezier(.34, 1.56, .64, 1)` and never uses it, so
+/// nothing on the page moves on it. A property some rule reads, or one read
+/// through another property, keeps the finding.
+fn bezier_is_unread_custom_property(style_text: &str, index: usize) -> bool {
+    let before = &style_text[..index];
+    let start = before.rfind([';', '{', '}']).map(|i| i + 1).unwrap_or(0);
+    let Some(m) = CUSTOM_PROP_DECL_RE.captures(&before[start..]) else {
+        return false;
+    };
+    let name = &m[1];
+    let reads = Regex::new(&format!(r"var\(\s*{}\s*[,)]", regex::escape(name)));
+    match reads {
+        Ok(re) => !re.is_match(style_text),
+        Err(_) => false,
+    }
+}
+
 /// JS: checks.mjs#checkHtmlPatterns. `corpora` defaults to
 /// `buildHtmlPatternCorpora(html)`. Findings' `index` fields are byte
 /// offsets into `corpora.style_text`.
@@ -512,6 +628,27 @@ pub fn check_html_patterns_with(
     html: &str,
     corpora: Option<&HtmlPatternCorpora>,
     context: &PatternContext,
+) -> Vec<PatternFinding> {
+    check_html_patterns_picking(html, corpora, context, &|_| true)
+}
+
+/// [`check_html_patterns_with`] where a rule that reports only its first
+/// candidate (bounce-easing, dark-glow, radial-halo,
+/// repeating-stripes-gradient, codex-grid-background) reports the first one
+/// `stands` accepts. A rendering engine passes its selector and paint gates,
+/// so a candidate whose rule matches nothing it shows (a rule inside an
+/// `@media` block that does not apply) does not hide a later one that
+/// does. The file engines accept every candidate, which is the first. Each
+/// rule offers `stands` at most [`PICK_MAX_CANDIDATES`] candidates: every
+/// offer resolves a selector over the style text before it and the engine
+/// then queries the page for it, so an unbounded walk over a large
+/// stylesheet whose candidates all sit in rules nothing matches is
+/// quadratic in the stylesheet.
+pub fn check_html_patterns_picking(
+    html: &str,
+    corpora: Option<&HtmlPatternCorpora>,
+    context: &PatternContext,
+    stands: &dyn Fn(&PatternFinding) -> bool,
 ) -> Vec<PatternFinding> {
     let built;
     let corpora = match corpora {
@@ -634,7 +771,11 @@ pub fn check_html_patterns_with(
     // declaration is read, so a pulse never hides a bounce declared after it.
     // Every bounce-named token in a declaration's list is read the same way,
     // so a pulse listed first never hides a bounce listed after it.
+    let mut offered = 0usize;
     for bm in BOUNCE_ANIM_RE.captures_iter(style_text) {
+        if offered == PICK_MAX_CANDIDATES {
+            break;
+        }
         let list = &bm[1];
         let mut labels: Vec<String> = COMMA_WS_SPLIT_RE
             .split(list)
@@ -650,27 +791,42 @@ pub fn check_html_patterns_with(
         else {
             continue;
         };
-        findings.push(pf(
+        let finding = pf(
             "bounce-easing",
             format!("animation: {}", label),
             enclosing_css_selector(style_text, bm.get(0).unwrap().start()),
-        ));
-        break;
+        );
+        offered += 1;
+        if stands(&finding) {
+            findings.push(finding);
+            break;
+        }
     }
 
+    let mut offered = 0usize;
     for bm in BEZIER_RE.captures_iter(style_text) {
+        if offered == PICK_MAX_CANDIDATES {
+            break;
+        }
         let y1 = parse_float(&bm[2]);
         let y2 = parse_float(&bm[4]);
         if y1 < -0.1 || y1 > 1.1 || y2 < -0.1 || y2 > 1.1 {
-            findings.push(pf(
+            if bezier_is_unread_custom_property(style_text, bm.get(0).unwrap().start()) {
+                continue;
+            }
+            let finding = pf(
                 "bounce-easing",
                 format!(
                     "cubic-bezier({}, {}, {}, {})",
                     &bm[1], &bm[2], &bm[3], &bm[4]
                 ),
                 enclosing_css_selector(style_text, bm.get(0).unwrap().start()),
-            ));
-            break;
+            );
+            offered += 1;
+            if stands(&finding) {
+                findings.push(finding);
+                break;
+            }
         }
     }
 
@@ -689,46 +845,50 @@ pub fn check_html_patterns_with(
 
     // --- Dark glow / chromatic halo shadows ---
     let glow_hits = scan_css_text_for_glow_with(style_text, context.dark_page);
-    if let Some(first) = glow_hits.first() {
-        findings.push(pf(
-            "dark-glow",
-            first.snippet.clone(),
-            enclosing_css_selector(style_text, first.index),
-        ));
-    }
+    findings.extend(
+        glow_hits
+            .iter()
+            .map(|h| pf("dark-glow", h.snippet.clone(), enclosing_css_selector(style_text, h.index)))
+            .take(PICK_MAX_CANDIDATES)
+            .find(|f| stands(f)),
+    );
     let halo_hits = scan_css_text_for_radial_halo_with(style_text, context.dark_page);
-    if let Some(first) = halo_hits.first() {
-        findings.push(pf(
-            "radial-halo",
-            first.snippet.clone(),
-            enclosing_css_selector(style_text, first.index),
-        ));
-    }
+    findings.extend(
+        halo_hits
+            .iter()
+            .map(|h| pf("radial-halo", h.snippet.clone(), enclosing_css_selector(style_text, h.index)))
+            .take(PICK_MAX_CANDIDATES)
+            .find(|f| stands(f)),
+    );
 
     // --- Generated-UI tells: repeating-gradient stripes ---
-    if let Some(sm) = REPEATING_GRADIENT_RE
-        .find_iter(style_text)
-        .find(|m| {
-            let radial = js::to_lower_case(m.as_str()).contains("radial");
-            repeating_gradient_repeats(&style_text[m.end()..], radial)
-        })
-    {
-        findings.push(pf(
-            "repeating-stripes-gradient",
-            "repeating-gradient decorative stripes".to_string(),
-            enclosing_css_selector(style_text, sm.start()),
-        ));
-    }
+    findings.extend(
+        REPEATING_GRADIENT_RE
+            .find_iter(style_text)
+            .filter(|m| {
+                let radial = js::to_lower_case(m.as_str()).contains("radial");
+                repeating_gradient_repeats(&style_text[m.end()..], radial)
+            })
+            .map(|sm| {
+                pf(
+                    "repeating-stripes-gradient",
+                    "repeating-gradient decorative stripes".to_string(),
+                    enclosing_css_selector(style_text, sm.start()),
+                )
+            })
+            .take(PICK_MAX_CANDIDATES)
+            .find(|f| stands(f)),
+    );
 
     // --- Generated-UI tells: two-axis grid-line background ---
     let grid_hits = scan_css_text_for_grid_background(style_text);
-    if let Some(first) = grid_hits.first() {
-        findings.push(pf(
-            "codex-grid-background",
-            first.snippet.clone(),
-            enclosing_css_selector(style_text, first.index),
-        ));
-    }
+    findings.extend(
+        grid_hits
+            .iter()
+            .map(|h| pf("codex-grid-background", h.snippet.clone(), enclosing_css_selector(style_text, h.index)))
+            .take(PICK_MAX_CANDIDATES)
+            .find(|f| stands(f)),
+    );
 
     // --- Generated-copy tells: "X theater" framing copy ---
     {
@@ -939,6 +1099,45 @@ mod tests {
     }
 
     #[test]
+    fn shape_scene_reads_em_sizes_and_the_primitive_share() {
+        let scene = "<rect fill=\"red\"/><rect fill=\"blue\"/><rect fill=\"#0f0\"/><circle/><circle/><circle/><ellipse/><polygon/>";
+        let svg = |open: &str, extra: &str| {
+            scan_html_for_shape_assembled_illustration(&format!("{open}{scene}{extra}</svg>"))
+        };
+        // nic.sa's wordmark: an em size renders at the text's scale.
+        assert!(svg("<svg width=\"4.33em\" height=\"1em\" viewBox=\"0 0 3242 750\">", "").is_empty());
+        assert_eq!(
+            svg("<svg width=\"20em\" height=\"15rem\" viewBox=\"0 0 64 48\">", "")[0].snippet,
+            "inline <svg> scene: 8 primitive shapes, ~320x240px, 3 fill colors"
+        );
+        // `stroke-width` in em is not the SVG's width.
+        assert_eq!(svg("<svg stroke-width=\"1em\" viewBox=\"0 0 400 300\">", "").len(), 1);
+        // A drawing of paths with a few primitives among them.
+        let paths = "<path d=\"M0 0h1\"/>".repeat(25);
+        assert!(svg("<svg viewBox=\"0 0 400 300\">", &paths).is_empty(), "8 of 33");
+        let some_paths = "<path d=\"M0 0h1\"/>".repeat(24);
+        assert_eq!(svg("<svg viewBox=\"0 0 400 300\">", &some_paths).len(), 1, "8 of 32");
+        // Unused assets in `<defs>` change neither count.
+        let unused = format!("<defs>{}</defs>", paths.repeat(2));
+        assert_eq!(svg("<svg viewBox=\"0 0 400 300\">", &unused).len(), 1, "defs paths are not drawn");
+        // Shapes in `<defs>` are drawn through the `<use>` that names them,
+        // once per use, and not otherwise.
+        let defs = |shapes: &str, uses: &str| {
+            scan_html_for_shape_assembled_illustration(&format!(
+                "<svg viewBox=\"0 0 400 300\"><defs>{shapes}</defs>{uses}</svg>"
+            ))
+            .len()
+        };
+        let icon = "<rect id=\"a\" fill=\"red\"/><circle id=\"b\" fill=\"blue\"/><ellipse id=\"c\" fill=\"#0f0\"/>";
+        let eight = "<use href=\"#a\"/>".repeat(4) + &"<use xlink:href=\"#b\"/>".repeat(2) + &"<use href=\"#c\"/>".repeat(2);
+        assert_eq!(defs(icon, &eight), 1, "eight referenced primitives");
+        assert_eq!(defs(icon, "<use href=\"#a\"/>"), 0, "one use of one icon");
+        assert_eq!(defs(icon, "<use href=\"#nope\"/>"), 0, "a use that names no asset");
+        let unused_eight = "<rect id=\"x1\" fill=\"red\"/><rect id=\"x2\" fill=\"blue\"/><rect id=\"x3\" fill=\"#0f0\"/><circle id=\"x4\"/><circle id=\"x5\"/><circle id=\"x6\"/><ellipse id=\"x7\"/><polygon id=\"x8\"/>";
+        assert_eq!(defs(unused_eight, "<use href=\"#x1\"/>"), 0, "one use among eight unused assets");
+    }
+
+    #[test]
     fn spacing_and_theater_match_node() {
         let out = check_html_patterns(
             "<style>.a{padding:8px;margin:8px;gap:8px;padding-top:8px;margin-left:8px;padding:8px;margin:0.5rem;gap:5000000000px;padding:9px}</style><p class=\"p-2 gap-2\">security theater here</p>",
@@ -1009,5 +1208,76 @@ mod tests {
 @keyframes sk-bounceDelay{0%,100%{transform:scale(0)}50%{transform:scale(1)}}\
 @keyframes sk-bounceDelay2{0%,100%{opacity:0}50%{opacity:1}}";
         assert!(bounce(pulses).is_empty());
+    }
+
+    /// Review of #1042: each one-candidate rule offers the gate a bounded
+    /// number of candidates, so a large stylesheet whose candidates all sit
+    /// in rules the page does not show costs a fixed number of selector
+    /// reads per rule, not one per candidate.
+    #[test]
+    fn picking_offers_each_rule_a_bounded_number_of_candidates() {
+        let mut css = String::new();
+        for i in 0..200 {
+            css.push_str(&format!(
+                ".gone{i} {{ box-shadow: 0 0 16px rgba(26, 58, 214, 0.8); background: repeating-linear-gradient(45deg,#000 0 2px,#fff 2px 4px); transition: transform .3s cubic-bezier(.2,1.4,.4,1); animation: bounce-in 1s }}\n"
+            ));
+        }
+        let offers = std::cell::RefCell::new(std::collections::HashMap::<String, usize>::new());
+        let found = check_html_patterns_picking(
+            &format!("<style>{css}</style>"),
+            None,
+            &PatternContext::default(),
+            &|f| {
+                *offers.borrow_mut().entry(f.id.clone()).or_default() += 1;
+                false
+            },
+        );
+        assert!(found.iter().all(|f| !matches!(f.id.as_str(), "dark-glow" | "repeating-stripes-gradient" | "bounce-easing")));
+        let offers = offers.into_inner();
+        for id in ["dark-glow", "repeating-stripes-gradient"] {
+            assert_eq!(offers.get(id).copied(), Some(PICK_MAX_CANDIDATES), "{id}");
+        }
+        // Two forms, the animation name and the curve, each bounded.
+        assert_eq!(offers.get("bounce-easing").copied(), Some(2 * PICK_MAX_CANDIDATES));
+    }
+
+    /// observations-1004 row 25 (incredible.one 10048475): a bounce curve
+    /// that is only the value of a custom property no `var()` reads moves
+    /// nothing. Read by a rule, or written into a transition directly, it
+    /// reports; an unread curve does not hide a used one after it.
+    #[test]
+    fn an_unread_custom_property_curve_is_not_a_bounce() {
+        let bounce = |css: &str| -> Vec<String> {
+            check_html_patterns(&format!("<style>{css}</style>"), None)
+                .into_iter()
+                .filter(|f| f.id == "bounce-easing")
+                .map(|f| f.snippet)
+                .collect()
+        };
+        let defined = ":root{--ease-bounce: cubic-bezier(.34, 1.56, .64, 1); --ease-out: ease-out}";
+        assert!(bounce(defined).is_empty(), "defined, never read");
+        assert_eq!(
+            bounce(&format!("{defined} .pop{{transition: transform .3s var(--ease-bounce)}}")),
+            vec!["cubic-bezier(.34, 1.56, .64, 1)".to_string()],
+            "read by a rule"
+        );
+        assert_eq!(
+            bounce(&format!("{defined} .pop{{transition: transform .3s var( --ease-bounce , ease)}}")),
+            vec!["cubic-bezier(.34, 1.56, .64, 1)".to_string()],
+            "read with a fallback"
+        );
+        assert_eq!(
+            bounce(&format!("{defined} .pop{{transition: transform .3s cubic-bezier(.2, 1.4, .4, 1)}}")),
+            vec!["cubic-bezier(.2, 1.4, .4, 1)".to_string()],
+            "a used curve after an unread one"
+        );
+        assert_eq!(
+            bounce(".pop{transition: transform .3s cubic-bezier(.34, 1.56, .64, 1)}"),
+            vec!["cubic-bezier(.34, 1.56, .64, 1)".to_string()],
+            "written directly"
+        );
+        // A property whose name only starts like the defined one does not
+        // read it.
+        assert!(bounce(&format!("{defined} .pop{{transition: transform .3s var(--ease-bounce-soft)}}")).is_empty());
     }
 }
