@@ -3271,7 +3271,14 @@
     const P = paramsPanelPalette || barPaletteForTheme(detectPageTheme());
     paramsPanelBody.innerHTML = '';
     for (const p of params) {
-      const value = Object.hasOwn(paramsCurrentValues, p.id) ? paramsCurrentValues[p.id] : p.default;
+      // A knob the panel shows must be in the live values and on the variant,
+      // or accept drops it and the preview ignores it. Seed only missing keys
+      // so a reopen keeps edits.
+      if (!Object.hasOwn(paramsCurrentValues, p.id)) {
+        paramsCurrentValues[p.id] = p.default;
+        applyParamValue(variantEl, p, p.default);
+      }
+      const value = paramsCurrentValues[p.id];
       const row = el('div', { display: 'flex', flexDirection: 'column', gap: '6px' });
       const labelRow = el('div', {
         display: 'flex', justifyContent: 'space-between',

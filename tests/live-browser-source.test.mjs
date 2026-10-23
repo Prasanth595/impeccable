@@ -1398,3 +1398,24 @@ describe('Tune session boundaries', () => {
     assert.equal(h.context.tuneOpen, false);
   });
 });
+
+describe('Tune first open without a refresh', () => {
+  it('seeds and applies displayed defaults so the preview, accept and toggles agree', () => {
+    const h = tuneHarness([
+      { id: 'size', kind: 'range', min: 0, max: 1, default: 0.4 },
+      { id: 'italic', kind: 'toggle', default: true },
+      { id: 'face', kind: 'steps', default: 'serif', options: ['sans', 'serif'] },
+    ]);
+    // Tune parameters can land on the visible variant after its last refresh.
+    h.api.openTunePopover();
+    assert.deepEqual({ ...h.context.paramsCurrentValues }, { size: 0.4, italic: true, face: 'serif' });
+    assert.deepEqual({ ...h.variant.values }, { size: 0.4, italic: true, face: 'serif' });
+    h.fire(h.body.children[1].children[1], 'click');
+    assert.equal(h.context.paramsCurrentValues.italic, false, 'one click turns a default-on toggle off');
+    assert.equal(h.variant.values.italic, false);
+    h.api.closeTunePopover();
+    h.api.openTunePopover();
+    assert.equal(h.context.paramsCurrentValues.italic, false, 'reopen keeps the edit');
+    assert.equal(h.context.paramsCurrentValues.size, 0.4);
+  });
+});
