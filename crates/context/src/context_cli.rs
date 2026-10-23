@@ -945,6 +945,7 @@ mod image_gen_directive_tests {
             command: "npx impeccable".to_string(),
             skill_dir: Some("/home/user/.claude/skills/impeccable".to_string()),
             self_cmd: "~/.claude/skills/impeccable/bin/impeccable".to_string(),
+            self_raw: "~/.claude/skills/impeccable/bin/impeccable".to_string(),
         }
     }
 
