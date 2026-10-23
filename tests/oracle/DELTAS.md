@@ -7216,3 +7216,21 @@ ordinary goldens again, not accepted deltas. The new cases
 `live-inject-csp-meta-quote-styles` and `live-inject-csp-meta-quote-styles-remove`
 pin the in-place patch of the raw content value (references kept, inserted
 sources encoded for the quote style) and the round trip.
+
+
+## Recorded 2026-10-19: one media environment for static HTML (#988)
+
+Per the [approved policy](https://github.com/pbakaus/impeccable/issues/988#issuecomment-6194496662), static HTML scans use screen, light color scheme, and the default 1280 × 800 viewport. Inline/local linked stylesheet media attributes and nested `@media` blocks are filtered before declarations, custom properties, keyframes, and CSS pattern checks. Unsupported queries are excluded, even when negated. This does not change plain CSS/JS text scans or the frozen function-level vectors.
+
+The following CLI goldens were regenerated from the native build and reviewed as finding-by-finding JSON changes and line-by-line text changes. Exit codes remain 2; no unrelated findings or advisory counts change.
+
+- `detect-fixture-json-linked-url-patterns-html`, `detect-fixture-text-linked-url-patterns-html`: remove only the contrast finding on `div.inactive-media-stripes`, whose gradient is inside `(max-width: 1px)`. The inactive `@supports` case remains; this PR does not evaluate supports conditions. The fixture count changes from 12 to 11.
+- `detect-fixture-json-pulsing-dot-html`, `detect-fixture-text-pulsing-dot-html`: remove only the `.rec-mark` pulsing-dot finding. Its animation is inside `(prefers-reduced-motion: no-preference)`, which this static environment does not evaluate. Both reduced-motion branches are excluded. The fixture count changes from 5 to 4; the rendered/browser path remains unchanged.
+- `detect-fixture-json-static-media-environment-html`, `detect-fixture-text-static-media-environment-html`: new fixture with four real low-contrast findings under matching screen/light/width/list queries and five passing cases under print/dark/narrow/unknown/negated-unknown queries.
+- `detect-dir-json-all-fixtures`, `detect-dir-text-all-fixtures`, `detect-dir-quiet-all-fixtures`, `detect-no-advisory-json`, `detect-no-advisory-text`: the same two removals plus the four new fixture findings. The total changes from 982 to 984; the 173 advisory notes are unchanged. Scope-filtered goldens do not change.
+
+`tests/oracle/vectors/calls/` and the historical `collectStaticCssRules` collector are unchanged. Runtime filtering occurs before that collector.
+
+Re-recorded 2026-10-22 after merging main `490141501` (including #998). Both main and this merged tree were built from source, and the five aggregate cases were compared against fresh runs of each binary. The only finding differences are the same two removals and four new fixture findings described above: non-advisory counts move from 1,026 to 1,028, while all 178 advisories remain unchanged. JSON findings and text output were reviewed individually; exit codes remain 2. Frozen function-level vectors are unchanged.
+
+Review follow-up, 2026-10-23 (#1079): negative lengths in width/height media conditions are valid comparisons, not unsupported conditions. The new `negative-media-dimensions.html` fixture covers four active conditions and five inactive controls. Its JSON/text goldens report exactly four low-contrast findings, matching a real Chromium scan; both exit 2. Compared with the pre-fix `ec80ea6b9` binary on the identical fixture tree, the five aggregate goldens gain only those four findings: non-advisory counts 1,028 to 1,032, all 178 advisories unchanged, no removals, exit 2. JSON findings and text differences were reviewed individually. Filtering each stylesheet once at collection also removes repeated media passes and prevents an unclosed inactive media block in one sheet from consuming the next sheet; a failing-first integration test covers that boundary. Frozen function-level vectors are unchanged.
