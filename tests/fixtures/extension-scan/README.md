@@ -23,11 +23,19 @@ In each browser:
 
 1. Open `flagged.html`, open the extension popup, and click **Scan page**.
    Expect one finding and an overlay on the pale paragraph, with no startup error.
-2. Scan again. Expect the same result without duplicate overlays.
-3. Follow the link to `clean.html` and explicitly scan. Expect zero findings
+2. Use Tab to focus **Copy all findings**, then press Enter. Expect a visible
+   “Copied findings” message. Paste into a plain text editor. The report must
+   name the scanned URL, show `Total findings: 1`, and include the low-contrast
+   detail and the pale paragraph's selector. Repeat with Space.
+3. Scan again. Copy must be disabled while scanning, then become available with
+   the same report and no duplicate overlays.
+4. Follow the link to `clean.html` and explicitly scan. Expect zero findings
    and no error (zero before a scan is not proof of successful scanning).
-4. Navigate back to `flagged.html` and scan. Expect one finding again.
-5. In Chrome, close and reopen the browser, then repeat the first scan.
+   **Copy all findings** must be disabled until this scan completes. After it
+   completes, copy and paste the report: it must name `clean.html`, show
+   `Total findings: 0`, and say no anti-patterns were found.
+5. Navigate back to `flagged.html` and scan. Expect one finding again.
+6. In Chrome, close and reopen the browser, then repeat the first scan.
    Firefox removes temporary extensions when it closes: reopen Firefox and load
    the extension again through `about:debugging`, or rerun `web-ext run`, then
    repeat the first scan. This exercises a cold core startup in each browser.
@@ -35,3 +43,23 @@ In each browser:
 The released Firefox 1.4.0 artifact fails at step 1 with the
 `OFFSCREEN_DOCUMENT` error from issue #847. Test desktop Firefox and Chrome
 separately; the shared detector bundle does not make their hosting APIs identical.
+
+
+## Copy report edge cases
+
+- Open a second tab and scan it from DevTools. Reopen the popup on the first
+  tab: it must copy only the first tab's findings and URL.
+- Reload the scanned page or navigate to another URL. Old results must not be
+  available to copy before a fresh scan completes.
+- Try a blocked page such as `chrome://extensions` or `about:debugging`. A failed
+  scan must not enable copying or retain a report from an earlier page.
+- Open Impeccable in DevTools. Use **Copy all findings** and a finding's copy
+  button. Compare the report with the popup report and confirm that selectors,
+  categories, details, and suggested skills remain present.
+- Scan `../antipatterns/hard-offset-shadow.html` from the same fixture server
+  (serve `tests/fixtures` instead if needed). Advisory findings must appear in
+  an **Advisories** section. A hard offset shadow must not add a generic
+  `/polish` suggestion.
+- Clipboard rejection and delayed scan/navigation messages are covered by
+  `tests/extension-popup.test.mjs`; success in a stubbed clipboard is not a
+  substitute for the real Chrome and Firefox copy-and-paste checks above.

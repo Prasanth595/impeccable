@@ -15,10 +15,11 @@ function scannerHarness({ firefox = false, existingHost = false, failFirstCreate
   const frames = [];
   let creates = 0;
   let ready = existingHost;
-  const event = () => ({ addListener() {} });
+  const listeners = {};
+  const event = name => ({ addListener(callback) { listeners[name] = callback; } });
   const chrome = {
     runtime: {
-      onMessage: event(), onConnect: event(),
+      onMessage: event('message'), onConnect: event('connect'),
       getURL: (file) => `moz-extension://test/${file}`,
       async getContexts(filter) {
         if (firefox) throw new Error('Invalid enumeration value "OFFSCREEN_DOCUMENT"');
@@ -30,6 +31,8 @@ function scannerHarness({ firefox = false, existingHost = false, failFirstCreate
         if (message.action === 'ping') return ping ? ping() : { ok: ready };
       },
     },
+    action: { async setBadgeText() {}, async setBadgeBackgroundColor() {} },
+    webNavigation: { onCompleted: event('navigation') },
     scripting: { async executeScript() {} },
     storage: { sync: { async get(defaults) { return defaults; } } },
     tabs: {
@@ -50,7 +53,7 @@ function scannerHarness({ firefox = false, existingHost = false, failFirstCreate
   if (!firefox) chrome.offscreen = { async createDocument() { create(); } };
   const context = vm.createContext({ chrome, document, setTimeout });
   vm.runInContext(readFileSync(path.join(ROOT, 'extension/background/service-worker.js'), 'utf8'), context);
-  return { context, frames, runtimeMessages, tabMessages, creates: () => creates };
+  return { context, frames, runtimeMessages, tabMessages, listeners, creates: () => creates };
 }
 
 describe('extension rule core startup', () => {
@@ -196,5 +199,52 @@ describe('extension badge colors', () => {
     assert.match(source, /setBadgeBackgroundColor\(\{ color: '#ffba00'/);
     assert.match(source, /setBadgeTextColor\(\{ color: '#0b0903'/);
     assert.doesNotMatch(source, /#d6336c/, 'the magenta badge is retired');
+  });
+});
+
+
+describe('extension popup scan state', () => {
+  const url = 'https://example.test/scanned#card';
+  function report(h, findings = []) {
+    h.listeners.message({ action: 'findings', findings }, { url, tab: { id: 7 } }, () => {});
+  }
+  function state(h) {
+    let result;
+    h.listeners.message({ action: 'get-state', tabId: 7 }, {}, value => { result = value; });
+    return result;
+  }
+
+  it('marks an empty scan complete and includes the source URL in popup broadcasts', () => {
+    const h = scannerHarness();
+    assert.equal(state(h).scanComplete, false);
+    report(h);
+    assert.equal(state(h).scanComplete, true);
+    assert.equal(state(h).url, url);
+    const message = h.runtimeMessages.find(message => message.action === 'findings-updated');
+    assert.equal(message.url, url);
+    assert.equal(message.tabId, 7);
+    assert.equal(message.findings.length, 0);
+  });
+
+  it('invalidates cached copy data while scanning and after failure', async () => {
+    const h = scannerHarness();
+    report(h);
+    await vm.runInContext('sendScanToTab(7)', h.context);
+    assert.equal(state(h).scanComplete, false);
+    assert.ok(h.runtimeMessages.some(message => message.action === 'scan-started' && message.tabId === 7));
+    report(h);
+    h.listeners.message({ action: 'detector-error', message: 'Snapshot failed' }, { tab: { id: 7 } }, () => {});
+    assert.equal(state(h).scanComplete, false);
+  });
+
+  it('clears source URL and scan state on top-level navigation and notifies the popup', () => {
+    const h = scannerHarness();
+    report(h);
+    h.listeners.navigation({ tabId: 7, frameId: 2 });
+    assert.equal(state(h).scanComplete, true);
+    h.listeners.navigation({ tabId: 7, frameId: 0 });
+    assert.equal(state(h).scanComplete, false);
+    assert.equal(state(h).url, '');
+    assert.ok(h.runtimeMessages.some(message => message.action === 'navigated' && message.tabId === 7));
   });
 });
