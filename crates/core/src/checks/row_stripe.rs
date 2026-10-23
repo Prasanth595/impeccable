@@ -45,11 +45,7 @@ re!(
     ROW_ROLE_RE,
     r#"(?i)\[role\s*=\s*["']?(?:row|cell|gridcell|rowheader)["']?\s*\]"#.to_string()
 );
-re!(
-    ROW_CLASS_RE,
-    r"(?i)\.(?:[A-Za-z0-9]+[-_]+)*(?:row|cell|gridcell)(?:[-_]+[A-Za-z0-9]+)*(?:$|[^-_A-Za-z0-9])"
-        .to_string()
-);
+re!(CLASS_RE, r"\.([-_A-Za-z0-9]+)".to_string());
 re!(
     STATUS_MARKER_RE,
     r"(?i)\.(?:is|has)-[-_A-Za-z0-9]|\.[A-Za-z0-9_-]+--[A-Za-z0-9]|\[\s*(?:data-[-_A-Za-z0-9]+|aria-invalid)"
@@ -80,6 +76,10 @@ re!(
     r"(?i)^(?:none|transparent|inherit|initial|unset|revert|currentcolor)$".to_string()
 );
 re!(
+    RESET_RE,
+    r"(?i)^(?:none|transparent|initial|unset|0|0px)$".to_string()
+);
+re!(
     BORDER_STYLE_NONE_RE,
     r"(?i)^(?:none|hidden)$".to_string()
 );
@@ -103,12 +103,48 @@ const SIDE_BORDERS: &[(&str, &str)] = &[
 /// Whether a selector's subject (the compound after its last combinator) is
 /// a table row or cell: a `tr` / `td` / `th`, an ARIA row or cell, or a
 /// class named for one (`.row`, `.data-cell`, `.table__row`). A selector
-/// list is one when any of its selectors is.
+/// list is one when any of its selectors is. What a functional pseudo-class
+/// names (`:not(.row)`, `:has(td)`) is not the subject.
 pub fn is_row_or_cell_selector(selector: &str) -> bool {
     split_commas_outside_parens(selector).into_iter().any(|part| {
-        let subject = subject_compound(js::trim(part));
-        ROW_TAG_RE.is_match(subject) || ROW_ROLE_RE.is_match(subject) || ROW_CLASS_RE.is_match(subject)
+        let subject = without_arguments(subject_compound(js::trim(part)));
+        ROW_TAG_RE.is_match(&subject)
+            || ROW_ROLE_RE.is_match(&subject)
+            || CLASS_RE.captures_iter(&subject).any(|c| class_names_a_row(&c[1]))
     })
+}
+
+/// Whether a class names a row or cell: a `row` / `cell` / `gridcell`
+/// segment that is not a layout utility's (`flex-row`, `grid-row`,
+/// `row-span-2`, `row-gap-4`, `row-cols-3`).
+fn class_names_a_row(class: &str) -> bool {
+    let segments: Vec<String> = class
+        .split(|c| c == '-' || c == '_')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    segments.iter().enumerate().any(|(i, seg)| {
+        matches!(seg.as_str(), "row" | "cell" | "gridcell")
+            && !(i > 0 && matches!(segments[i - 1].as_str(), "flex" | "grid" | "inline"))
+            && !segments.get(i + 1).is_some_and(|next| {
+                matches!(next.as_str(), "span" | "start" | "end" | "gap" | "reverse" | "auto" | "cols")
+            })
+    })
+}
+
+/// The selector with every parenthesised argument dropped.
+fn without_arguments(selector: &str) -> String {
+    let mut out = String::with_capacity(selector.len());
+    let mut depth = 0i32;
+    for c in selector.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Whether a selector styles a state of the row rather than every row: an
@@ -134,8 +170,12 @@ fn subject_compound(selector: &str) -> &str {
     &selector[p..]
 }
 
-/// Whether a declaration paints something of its own beside the stripe.
-fn paints(prop: &str) -> bool {
+/// Whether a declaration paints something of its own beside the stripe. A
+/// reset (`background: none`, `border: 0`) paints nothing.
+fn paints(prop: &str, value: &str) -> bool {
+    if RESET_RE.is_match(js::trim(value)) {
+        return false;
+    }
     (prop.starts_with("background") && prop != "background-clip")
         || (prop.starts_with("border")
             && !matches!(prop, "border-collapse" | "border-spacing")
@@ -222,9 +262,13 @@ fn inset_stripe(
     None
 }
 
-/// A side border that is a stripe: `(property, thickness, edge)`.
+/// A side border that is a stripe: `(property, thickness, edge)`. `block`
+/// is the rule's declarations as written: a later declaration wins, so a
+/// shared `border-style: none` after the side border hides it, and a reset
+/// before it does not.
 fn border_stripe(
     decls: &crate::checks::css_scan::DeclMap,
+    block: &str,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Option<(&'static str, f64, &'static str)> {
     // A border all round is a frame, not a stripe.
@@ -233,34 +277,53 @@ fn border_stripe(
             return None;
         }
     }
+    let ordered: Vec<(String, String)> = block
+        .split(';')
+        .filter_map(|part| {
+            let (prop, value) = part.split_once(':')?;
+            let prop = js::to_lower_case(js::trim(prop));
+            let value = resolve_var_refs(js::trim(value), &|name: &str| lookup(name), 0);
+            (!prop.is_empty()).then(|| (prop, js::trim(&value).to_string()))
+        })
+        .collect();
     for &(prop, edge) in SIDE_BORDERS {
-        let shorthand = decls.get(prop).map(String::as_str).unwrap_or("");
         let mut width = None;
         let mut colour = String::new();
-        let mut styled = shorthand.is_empty();
-        let resolved = resolve_var_refs(shorthand, &|name: &str| lookup(name), 0);
-        for token in split_ws_outside_parens(&resolved) {
-            if BORDER_STYLE_NONE_RE.is_match(token) {
-                styled = false;
-                width = None;
-                break;
+        let mut styled = false;
+        for (p, value) in &ordered {
+            if p == "border" {
+                (width, styled) = (None, false);
+                colour.clear();
+            } else if p == "border-style" {
+                let sides = split_ws_outside_parens(value);
+                let at = match (sides.len(), edge) {
+                    (0, _) => continue,
+                    (1, _) => 0,
+                    (4, "left") => 3,
+                    _ => 1,
+                };
+                styled = BORDER_STYLE_RE.is_match(sides[at]);
+            } else if p == prop {
+                (width, styled) = (None, false);
+                colour.clear();
+                for token in split_ws_outside_parens(value) {
+                    if BORDER_STYLE_RE.is_match(token) {
+                        styled = true;
+                    } else if BORDER_STYLE_NONE_RE.is_match(token) {
+                        styled = false;
+                    } else if let Some(px) = css_length_to_px(token) {
+                        width = Some(px);
+                    } else {
+                        colour = token.to_string();
+                    }
+                }
+            } else if p.strip_prefix(prop) == Some("-width") {
+                width = css_length_to_px(value);
+            } else if p.strip_prefix(prop) == Some("-color") {
+                colour = value.clone();
+            } else if p.strip_prefix(prop) == Some("-style") {
+                styled = BORDER_STYLE_RE.is_match(value);
             }
-            if BORDER_STYLE_RE.is_match(token) {
-                styled = true;
-            } else if let Some(px) = css_length_to_px(token) {
-                width = Some(px);
-            } else {
-                colour = token.to_string();
-            }
-        }
-        if let Some(w) = decls.get(&format!("{prop}-width")) {
-            width = css_length_to_px(&resolve_var_refs(w, &|name: &str| lookup(name), 0));
-        }
-        if let Some(c) = decls.get(&format!("{prop}-color")) {
-            colour = c.clone();
-        }
-        if let Some(s) = decls.get(&format!("{prop}-style")) {
-            styled = !BORDER_STYLE_NONE_RE.is_match(js::trim(s));
         }
         let Some(width) = width.filter(|w| in_band(*w)) else {
             continue;
@@ -345,7 +408,7 @@ pub fn scan_css_text_for_row_stripe(content: &str, tokens: Option<&CustomProps>)
                 "box-shadow",
                 format!("{} — inset box-shadow {}px stripe on a row or cell ({edge} edge)", collapse(selector), number_to_string(px)),
             )
-        } else if let Some((prop, px, edge)) = border_stripe(&decls, &lookup) {
+        } else if let Some((prop, px, edge)) = border_stripe(&decls, &m[2], &lookup) {
             (
                 prop,
                 format!("{} — {prop} {}px stripe on a row or cell ({edge} edge)", collapse(selector), number_to_string(px)),
@@ -355,7 +418,7 @@ pub fn scan_css_text_for_row_stripe(content: &str, tokens: Option<&CustomProps>)
         };
         let stripe_only = decls
             .iter()
-            .all(|(p, _)| !paints(p) || p == stripe_prop || p.starts_with(&format!("{stripe_prop}-")));
+            .all(|(p, v)| !paints(p, v) || p == stripe_prop || p.starts_with(&format!("{stripe_prop}-")));
         if !selector_has_status_marker(selector) && !stripe_only {
             continue;
         }
@@ -393,6 +456,11 @@ mod tests {
             ".table__row--new { border-inline-start: 2px solid #16a34a; padding: 4px; }",
             ":root { --mark: #d0342c; } tr.is-x td:first-child { box-shadow: inset 3px 0 0 var(--mark); }",
             "tr.is-x td { box-shadow: inset 3px 0 0 var(--color-danger); }",
+            // A reset beside the stripe paints nothing of its own.
+            "td { box-shadow: inset 3px 0 0 #d0342c; background: none; border: 0; }",
+            // A shared style reset before the side border does not hide it.
+            "td.is-x { border-style: none; border-left: 3px solid #d0342c; }",
+            ".row:is(.x) { box-shadow: inset 3px 0 0 red; }",
         ] {
             assert_eq!(snippets(css).len(), 1, "{css}");
         }
@@ -432,6 +500,17 @@ mod tests {
             // A thick band is not a stripe.
             "tr.is-x td { border-left: 12px solid #d0342c; }",
             "/* tr.is-x td { box-shadow: inset 3px 0 0 #d0342c; } */",
+            // A row named only inside a functional pseudo-class.
+            ".panel:not(.row) { box-shadow: inset 3px 0 0 red; }",
+            ".pane:has(.row) { box-shadow: inset 3px 0 0 red; }",
+            ".pane:has(> td) { box-shadow: inset 3px 0 0 red; }",
+            // Layout utilities named for a row are not rows.
+            ".flex-row { box-shadow: inset 3px 0 0 red; }",
+            ".grid-row.is-x { box-shadow: inset 3px 0 0 red; }",
+            ".row-span-2 { border-left: 3px solid red; }",
+            // A shared border-style after the side border hides it.
+            "td.is-x { border-left: 3px solid #d0342c; border-style: none; }",
+            "td.is-x { border-left-width: 3px; border-left-color: #d0342c; }",
         ] {
             assert_eq!(snippets(css), Vec::<String>::new(), "{css}");
         }

@@ -13,6 +13,9 @@ use crate::file_system::SKIP_DIRS;
 use crate::jsp;
 use crate::util::exists;
 
+static COMMENT_RE: once_cell::sync::Lazy<regex::Regex> =
+    once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?s)/\*.*?\*/").expect("COMMENT_RE"));
+
 const SHEET_EXTS: &[&str] = &[".css", ".scss", ".sass", ".less"];
 /// Bounds on the walk: a token sheet is small, and a project with more
 /// sheets or entries than this has its tokens among the ones read first or
@@ -59,6 +62,8 @@ pub fn collect_project_tokens(root: &str) -> CustomProps {
         if !text.contains("--") {
             continue;
         }
+        // A commented-out declaration is not the token's value.
+        let text = COMMENT_RE.replace_all(&text, " ");
         for (name, value) in collect_css_custom_props(&text).iter() {
             if !tokens.has(name) {
                 tokens.set(name, value.clone());
@@ -139,7 +144,7 @@ mod tests {
         std::fs::write(dir.join("package.json"), "{}").unwrap();
         std::fs::write(
             dir.join("design-system/tokens.css"),
-            ":root { --mark-danger: oklch(63% .23 27); }\n[data-theme=dark] { --mark-danger: #f00; }\n",
+            "/* --mark-danger: #ddd; */\n:root { --mark-danger: oklch(63% .23 27); }\n[data-theme=dark] { --mark-danger: #f00; }\n",
         )
         .unwrap();
         let file = dir.join("app/src/Table.svelte").to_string_lossy().into_owned();

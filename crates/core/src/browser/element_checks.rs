@@ -528,10 +528,14 @@ pub fn check_element_inset_stripe_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
     if shadow.is_empty() || shadow == "none" || !shadow.contains("inset") {
         return Vec::new();
     }
+    // A row by class only (`.row-card`) that is rounded is a card, as the
+    // stylesheet scan leaves it to the card scans.
     let row = matches_or_false(dom, el, ROW_OR_CELL)
-        || class_attr(dom, el)
+        || (class_attr(dom, el)
             .split_whitespace()
-            .any(|c| crate::checks::row_stripe::is_row_or_cell_selector(&format!(".{c}")));
+            .any(|c| crate::checks::row_stripe::is_row_or_cell_selector(&format!(".{c}")))
+            && !parse_radius_corners(Some(&dom.style(el, "borderRadius")), dom.rect(el).width)
+                .is_some_and(|c| [c.top_left, c.top_right, c.bottom_right, c.bottom_left].iter().any(|r| *r > 0.0)));
     let tag = tag_lower(dom, el);
     if !row && (BORDER_SAFE_TAGS.contains(&tag.as_str()) || tag == "table" || tag == "summary") {
         return Vec::new();
@@ -5958,6 +5962,14 @@ mod tests {
         assert!(check_element_inset_stripe_dom(&d, card).is_empty());
         d.set_style(card, "borderRadius", "12px");
         assert_eq!(check_element_inset_stripe_dom(&d, card).len(), 1);
+        // A rounded row-like card is a card: square away from the stripe, it
+        // is silent; rounded away from it, it is the card tell.
+        d.set_attr(card, "class", "row-card is-error");
+        d.set_styles(card, &[("boxShadow", red), ("borderRadius", "12px 0px 0px 12px")]);
+        assert!(check_element_inset_stripe_dom(&d, card).is_empty());
+        d.set_style(card, "borderRadius", "12px");
+        let hits = check_element_inset_stripe_dom(&d, card);
+        assert!(hits.len() == 1 && !hits[0].snippet.contains("row or cell"), "{hits:?}");
     }
 
     #[test]
