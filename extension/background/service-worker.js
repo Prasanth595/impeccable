@@ -19,7 +19,7 @@ const OFFSCREEN_URL = 'offscreen/offscreen.html';
 
 function getState(tabId) {
   if (!tabState.has(tabId)) {
-    tabState.set(tabId, { findings: [], overlaysVisible: true, injected: false, csInjected: false });
+    tabState.set(tabId, { findings: [], url: '', scanComplete: false, overlaysVisible: true, injected: false, csInjected: false });
   }
   return tabState.get(tabId);
 }
@@ -155,11 +155,14 @@ async function ensureContentScriptInjected(tabId) {
 }
 
 function reportScanFailure(tabId, message) {
+  getState(tabId).scanComplete = false;
   chrome.runtime.sendMessage({ action: 'scan-failed', tabId, message }).catch(() => {});
   notifyPanels(tabId, { action: 'scan-failed', message });
 }
 
 async function sendScanToTab(tabId) {
+  getState(tabId).scanComplete = false;
+  chrome.runtime.sendMessage({ action: 'scan-started', tabId }).catch(() => {});
   const { ok, error } = await ensureContentScriptInjected(tabId);
   if (!ok) {
     // Injection was blocked. Tell an open popup why so it can stop showing
@@ -194,12 +197,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === 'findings' && tabId) {
     const state = getState(tabId);
     state.findings = msg.findings || [];
+    state.url = sender.url || sender.tab?.url || '';
+    state.scanComplete = true;
     state.injected = true;
     if (msg.stats) state.stats = msg.stats;
     updateBadge(tabId);
     notifyPanels(tabId, { action: 'findings', findings: state.findings });
     // Broadcast for popup
-    chrome.runtime.sendMessage({ action: 'findings-updated', tabId, findings: state.findings }).catch(() => {});
+    chrome.runtime.sendMessage({ action: 'findings-updated', tabId, findings: state.findings, url: state.url }).catch(() => {});
     sendResponse({ ok: true });
   }
 
@@ -261,6 +266,8 @@ async function tearDownTab(tabId) {
   const state = tabState.get(tabId);
   if (state) {
     state.findings = [];
+    state.url = '';
+    state.scanComplete = false;
     state.injected = false;
     state.csInjected = false;
   }
@@ -354,10 +361,13 @@ chrome.webNavigation?.onCompleted?.addListener((details) => {
   // DevTools wasn't open meant the popup-only flow saw a stale csInjected: true on the
   // second click and silently no-op'd against a tab that had no listener.
   state.findings = [];
+  state.url = '';
+  state.scanComplete = false;
   state.injected = false;
   state.csInjected = false;
   updateBadge(details.tabId);
   notifyPanels(details.tabId, { action: 'navigated' });
+  chrome.runtime.sendMessage({ action: 'navigated', tabId: details.tabId }).catch(() => {});
 
   // Auto-rescan only when DevTools is the driver — the popup is user-triggered and
   // shouldn't fire scans the user didn't ask for.
