@@ -550,18 +550,38 @@ pub fn check_element_inset_stripe_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
     if rect.width <= 40.0 || rect.height < 16.0 {
         return Vec::new();
     }
-    if row {
-        let host = closest_or_none(dom, el, "tr, [role=\"row\"]");
-        let selected = |e: ElId| {
-            dom.attr(e, "aria-selected").is_some_and(|v| v == "true")
-                || dom.attr(e, "aria-current").is_some_and(|v| v != "false")
-                || class_attr(dom, e).split_whitespace().any(|c| {
-                    crate::checks::css_scan::selector_is_state_indicator(&format!(".{c}"))
-                })
-        };
-        if selected(el) || host.is_some_and(selected) {
-            return Vec::new();
+    // The row an element sits in, by tag, role or a row-named class.
+    let host = {
+        let mut at = dom.parent(el);
+        loop {
+            match at {
+                Some(e) if tag_lower(dom, e) == "body" => break None,
+                Some(e)
+                    if matches_or_false(dom, e, "tr, [role=\"row\"]")
+                        || class_attr(dom, e)
+                            .split_whitespace()
+                            .any(|c| crate::checks::row_stripe::is_row_or_cell_selector(&format!(".{c}"))) =>
+                {
+                    break Some(e)
+                }
+                Some(e) => at = dom.parent(e),
+                None => break None,
+            }
         }
+    };
+    // A selected or current item's stripe marks the selection, on a row or
+    // a card alike.
+    let selected = |e: ElId| {
+        dom.attr(e, "aria-selected").is_some_and(|v| v == "true")
+            || dom.attr(e, "aria-current").is_some_and(|v| v != "false")
+            || class_attr(dom, e)
+                .split_whitespace()
+                .any(|c| crate::checks::css_scan::selector_is_state_indicator(&format!(".{c}")))
+    };
+    if selected(el) || (row && host.is_some_and(selected)) {
+        return Vec::new();
+    }
+    if row {
         // The row's state, or a cell that paints nothing but the stripe, as
         // the stylesheet scan asks: a shaded cell with an edge is a column.
         let status = |e: ElId| {
@@ -5999,6 +6019,23 @@ mod tests {
         d.set_style(card, "borderRadius", "12px");
         let hits = check_element_inset_stripe_dom(&d, card);
         assert!(hits.len() == 1 && !hits[0].snippet.contains("row or cell"), "{hits:?}");
+        // A selected rounded card's stripe marks the selection.
+        d.set_attr(card, "class", "row-card is-selected");
+        assert!(check_element_inset_stripe_dom(&d, card).is_empty());
+        // A cell in a row named by class takes the row's state and selection.
+        let list = d.add(Some(body), "div");
+        let row = d.add(Some(list), "div");
+        let cell = d.add(Some(row), "div");
+        for (el, w) in [(list, 600.0), (row, 600.0), (cell, 200.0)] {
+            visible(&mut d, el);
+            d.set_rect(el, 0.0, 0.0, w, 48.0);
+        }
+        d.set_attr(row, "class", "table__row is-broken");
+        d.set_attr(cell, "class", "table__cell");
+        d.set_styles(cell, &[("boxShadow", red), ("borderRadius", "0px"), ("backgroundColor", "rgb(248, 250, 252)")]);
+        assert_eq!(check_element_inset_stripe_dom(&d, cell).len(), 1);
+        d.set_attr(row, "class", "table__row is-broken is-selected");
+        assert!(check_element_inset_stripe_dom(&d, cell).is_empty());
     }
 
     #[test]

@@ -16,6 +16,9 @@ use crate::util::exists;
 static COMMENT_RE: once_cell::sync::Lazy<regex::Regex> =
     once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?s)/\*.*?\*/").expect("COMMENT_RE"));
 
+static LINE_COMMENT_RE: once_cell::sync::Lazy<regex::Regex> =
+    once_cell::sync::Lazy::new(|| regex::Regex::new(r#"(?m)(^|[^:"'(\\])//[^\n]*"#).expect("LINE_COMMENT_RE"));
+
 const SHEET_EXTS: &[&str] = &[".css", ".scss", ".sass", ".less"];
 /// Bounds on the walk: a token sheet is small, and a project with more
 /// sheets or entries than this has its tokens among the ones read first or
@@ -53,17 +56,18 @@ pub fn project_root(file_path: &str) -> String {
 pub fn collect_project_tokens(root: &str) -> CustomProps {
     let mut tokens = CustomProps::new();
     for sheet in stylesheets(root) {
-        if std::fs::metadata(&sheet).map_or(true, |m| m.len() > MAX_SHEET_BYTES) {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&sheet) else {
+        let Some(text) = read_sheet(&sheet) else {
             continue;
         };
         if !text.contains("--") {
             continue;
         }
-        // A commented-out declaration is not the token's value.
-        let text = COMMENT_RE.replace_all(&text, " ");
+        // A commented-out declaration is not the token's value: `/* */`
+        // everywhere, `//` lines in the preprocessor dialects.
+        let mut text = COMMENT_RE.replace_all(&text, " ").into_owned();
+        if !sheet.to_ascii_lowercase().ends_with(".css") {
+            text = LINE_COMMENT_RE.replace_all(&text, "$1").into_owned();
+        }
         for (name, value) in collect_css_custom_props(&text).iter() {
             if !tokens.has(name) {
                 tokens.set(name, value.clone());
@@ -71,6 +75,22 @@ pub fn collect_project_tokens(root: &str) -> CustomProps {
         }
     }
     tokens
+}
+
+/// A sheet's text: a regular file (not a link to a device or elsewhere),
+/// read no further than the size bound.
+fn read_sheet(path: &str) -> Option<String> {
+    use std::io::Read;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_SHEET_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).ok()?.take(MAX_SHEET_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_SHEET_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// The stylesheets under `root`, breadth first so a shallow token sheet
@@ -147,10 +167,14 @@ mod tests {
             "/* --mark-danger: #ddd; */\n:root { --mark-danger: oklch(63% .23 27); }\n[data-theme=dark] { --mark-danger: #f00; }\n",
         )
         .unwrap();
+        std::fs::write(dir.join("design-system/theme.scss"), "// --mark-ok: #ddd;\n:root { --mark-ok: #16a34a; }\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/dev/zero", dir.join("design-system/zero.css")).unwrap();
         let file = dir.join("app/src/Table.svelte").to_string_lossy().into_owned();
         assert_eq!(project_root(&file), root);
         let tokens = ProjectTokens::default().for_file(&file);
         assert_eq!(tokens.get("--mark-danger").map(String::as_str), Some("oklch(63% .23 27)"));
+        assert_eq!(tokens.get("--mark-ok").map(String::as_str), Some("#16a34a"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

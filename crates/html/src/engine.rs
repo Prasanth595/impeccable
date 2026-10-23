@@ -446,12 +446,19 @@ pub fn detect_html_source(
         );
         for f in row_hits {
             let Some(selector) = f.selector.as_deref() else { continue };
+            // The selector as written when the engine reads it, so a
+            // `:not()` keeps excluding; stripped of what it cannot read
+            // otherwise.
             let stripped = PSEUDO_STRIP_RE.replace_all(selector, "");
-            let stripped = impeccable_core::js::trim(&stripped);
-            if doc.compile(stripped).is_err() {
+            let query = if doc.compile(selector).is_ok() {
+                selector
+            } else {
+                impeccable_core::js::trim(&stripped)
+            };
+            if doc.compile(query).is_err() {
                 continue;
             }
-            let hosts = doc.query_selector_all(stripped);
+            let hosts = doc.query_selector_all(query);
             if hosts.is_empty() || hosts.iter().all(|el| scoped_ignore_active(el, &f.id)) {
                 continue;
             }
