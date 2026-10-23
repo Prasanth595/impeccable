@@ -58,7 +58,8 @@ fn dimension(t: &Term) -> Option<f64> {
     match t {
         Term::Ident(s) if s == "width" => Some(WIDTH),
         Term::Ident(s) if s == "height" => Some(HEIGHT),
-        Term::Length(n) if n.is_finite() && *n >= 0.0 => Some(*n),
+        // A negative media length is valid; compare it with the viewport.
+        Term::Length(n) if n.is_finite() => Some(*n),
         _ => None,
     }
 }
@@ -322,6 +323,30 @@ mod tests {
             "(1000px < width > 500px)",
             "(width < 2000px < 3000px)",
             "(width) and (height) or (width)",
+        ] {
+            assert!(!matches_media(query), "{query}");
+        }
+    }
+
+    #[test]
+    fn negative_dimensions_are_comparable_not_unknown() {
+        for query in [
+            "(width > -1px)",
+            "not (max-width: -1px)",
+            "(height >= -1em)",
+            "(-1rem < width <= 80rem)",
+            "(min-height: -10px)",
+            "not (height: -1px)",
+        ] {
+            assert!(matches_media(query), "{query}");
+        }
+        for query in [
+            "(width: -1px)",
+            "(max-width: -1px)",
+            "(height < -1em)",
+            "(-2px < width < -1px)",
+            "not (min-height: -1px)",
+            "not (width: -1vw)",
         ] {
             assert!(!matches_media(query), "{query}");
         }

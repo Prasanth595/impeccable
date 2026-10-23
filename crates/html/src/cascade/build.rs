@@ -93,7 +93,8 @@ fn resolve_linked_css_path(file_dir: &str, href: &str) -> String {
 ///
 /// Returns that text plus a second one for the page-level pattern scan: the
 /// same join minus the linked sheets `ignored` accepts (given the resolved
-/// path). The cascade keeps the full text.
+/// path). Each active sheet is media-filtered once before it enters either
+/// corpus. The cascade keeps active styles from ignored sheets too.
 pub fn collect_static_css_text(
     doc: &StaticDocument,
     file_dir: &Path,
@@ -111,7 +112,7 @@ pub fn collect_static_css_text(
             .get_attribute("media")
             .is_none_or(|m| m.trim().is_empty() || super::media::matches_media(m))
         {
-            let text = style_el.text_content();
+            let text = super::media::screen_styles(&style_el.text_content());
             pattern_texts.push(text.clone());
             style_texts.push(text);
         }
@@ -137,7 +138,7 @@ pub fn collect_static_css_text(
         );
         match read {
             Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let text = super::media::screen_styles(&String::from_utf8_lossy(&bytes));
                 if !ignored.is_some_and(|f| f(&css_path)) {
                     pattern_texts.push(text.clone());
                 }
@@ -154,10 +155,7 @@ pub fn collect_static_css_text(
             }
         }
     }
-    (
-        super::media::screen_styles(&style_texts.join("\n")),
-        super::media::screen_styles(&pattern_texts.join("\n")),
-    )
+    (style_texts.join("\n"), pattern_texts.join("\n"))
 }
 
 static PSEUDO_RULE_RE: Lazy<Regex> = Lazy::new(|| {
@@ -314,14 +312,13 @@ fn mark_pseudo_rule(
 }
 
 /// JS: css-cascade.mjs#buildStaticStyleMap(root, staticDoc, cssText, modules, profile, filePath)
+/// `css_text` is already media-filtered by [`collect_static_css_text`].
 pub fn build_static_style_map(
     doc: &mut StaticDocument,
     css_text: &str,
     profile: Option<&dyn ProfileSink>,
     file_path: &str,
 ) {
-    let screen_css = super::media::screen_styles(css_text);
-    let css_text = screen_css.as_str();
     let mut specified: SpecifiedStore<NodeId> = SpecifiedStore::new();
     let mut hover_specified: SpecifiedStore<NodeId> = SpecifiedStore::new();
     let mut placeholder_specified: SpecifiedStore<NodeId> = SpecifiedStore::new();

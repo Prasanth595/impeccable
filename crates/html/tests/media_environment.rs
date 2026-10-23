@@ -139,3 +139,52 @@ fn shared_fixture_has_four_real_findings_and_no_inactive_findings() {
         "{findings:?}"
     );
 }
+
+#[test]
+fn negative_media_dimensions_keep_active_contrast_styles() {
+    for query in [
+        "(width > -1px)",
+        "not (max-width: -1px)",
+        "(height >= -1em)",
+        "(-1rem < width <= 80rem)",
+    ] {
+        assert_eq!(
+            contrast_count(&format!("@media {query}{{body{{color:#eee}}}}")),
+            1,
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn an_unclosed_inactive_sheet_does_not_consume_the_next_sheet() {
+    let html = "<html><head><style>body{color:#111;background:#fff;font:16px Georgia}</style><style>@media print { body { color:#111 }</style><style>body{color:#eee}</style></head><body><p>Active second sheet still applies.</p></body></html>";
+    let findings = detect_html_source(
+        html,
+        Path::new("/tmp/media-sheet-boundary.html"),
+        &DetectHtmlOptions::default(),
+    );
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|f| f.antipattern == "low-contrast")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn negative_dimension_fixture_reports_only_the_four_active_cases() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/antipatterns/negative-media-dimensions.html");
+    let html = std::fs::read_to_string(&path).unwrap();
+    let findings = detect_html_source(&html, &path, &DetectHtmlOptions::default());
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|f| f.antipattern == "low-contrast")
+            .count(),
+        4,
+        "{findings:?}"
+    );
+}
