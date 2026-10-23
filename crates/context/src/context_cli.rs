@@ -193,20 +193,28 @@ fn append_build_path_directive(parts: &mut Parts, ctx: &Ctx, cwd: &str) {
 }
 
 fn append_image_gen_directive(parts: &mut Parts, env: &Env, provider: &Provider) {
-    // #832: the fallback is whichever of the two actually exists — the
+    // #832: the fallback is whichever of the two actually exists: the
     // user's OpenAI key, or an OpenAI-compatible endpoint configured in
-    // OPENAI_BASE_URL. An unusable configured base claims nothing:
-    // generate-image refuses to run until it is fixed or unset.
+    // OPENAI_BASE_URL. An unusable configured base claims nothing, and so
+    // does a combination generate-image would refuse (a remote plaintext
+    // http base carrying a key): generate-image refuses to run until it is
+    // fixed or unset.
     let Ok(configured_base) = crate::generate_image::configured_api_base(env) else {
         return;
     };
     if let Some(base) = configured_base {
         // A configured endpoint is the operator's own server: no OpenAI key
         // requirement, no OpenAI billing claim, and its model must be named.
+        // A key that would travel plaintext to a remote http base is refused
+        // by generate-image, so the same combination claims nothing here.
+        let key = env.get("OPENAI_API_KEY").filter(|k| !k.is_empty()).cloned().unwrap_or_default();
+        if crate::generate_image::plaintext_key_refusal(&base, &key).is_some() {
+            return;
+        }
         parts.push([
             "IMAGE_GEN_AVAILABLE: your harness-native image tool is always the first choice for generation; use it whenever one exists.".to_string(),
             "This environment also carries an OpenAI-compatible image endpoint as the fallback for harnesses with no native tool:".to_string(),
-            format!("`{} --prompt \"...\" --out <file> --model <id>` (the endpoint configured in OPENAI_BASE_URL at {base}; generations run there, not billed to OpenAI; --model names the model that endpoint serves; reference uploads (--ref) are unavailable there; say so before the first render, and never reach for it when a native tool exists).", provider.verb_cmd("generate-image")),
+            format!("`{} --prompt \"...\" --out <file> --model <id>` (the endpoint configured in OPENAI_BASE_URL at {base}; generations run on that endpoint; --model names the model that endpoint serves; say so before the first render, and never reach for it when a native tool exists).", provider.verb_cmd("generate-image")),
             "Visualizing a direction before building it measurably strengthens the result.".to_string(),
         ].join(" "));
         return;
@@ -913,8 +921,8 @@ mod image_gen_directive_tests {
     use super::*;
 
     // #832: IMAGE_GEN_AVAILABLE must describe whichever fallback actually
-    // exists — the user's OpenAI key, or a configured OpenAI-compatible
-    // endpoint from OPENAI_BASE_URL — and must not claim OpenAI billing for
+    // exists: the user's OpenAI key, or a configured OpenAI-compatible
+    // endpoint from OPENAI_BASE_URL, and must not claim OpenAI billing for
     // an endpoint that is not OpenAI. An unusable base claims nothing.
     fn provider() -> Provider {
         Provider {
@@ -950,10 +958,20 @@ mod image_gen_directive_tests {
         assert!(line.contains("OpenAI-compatible image endpoint"), "{line}");
         assert!(line.contains("http://127.0.0.1:8188/v1"), "{line}");
         assert!(line.contains("--model <id>"), "{line}");
-        assert!(line.contains("reference uploads (--ref) are unavailable"), "{line}");
+        assert!(line.contains("generations run on that endpoint"), "{line}");
         assert!(!line.contains("carries an OpenAI key"), "{line}");
         assert!(!line.contains("billed to the user's key"), "{line}");
         assert!(!line.contains("billed to your OpenAI key"), "{line}");
+        assert!(!line.contains("not billed to OpenAI"), "{line}");
+    }
+
+    #[test]
+    fn a_remote_plaintext_base_with_a_key_claims_nothing() {
+        // generate-image refuses a remote http base carrying a key; the
+        // directive must not advertise a fallback that cannot run.
+        assert!(directive(&[("OPENAI_BASE_URL", "http://images.example.net/v1"), ("OPENAI_API_KEY", "sk-oracle")]).is_none());
+        // Loopback http may carry the key, so it still claims.
+        assert!(directive(&[("OPENAI_BASE_URL", "http://127.0.0.1:8188/v1"), ("OPENAI_API_KEY", "sk-oracle")]).is_some());
     }
 
     #[test]
