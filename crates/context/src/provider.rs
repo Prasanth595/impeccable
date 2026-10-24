@@ -82,6 +82,7 @@ fn provider_from_skill_dir(skill_dir: &str) -> Option<&'static str> {
         ".grok" => "grok",
         ".agent" => "antigravity",
         ".hermes" => "hermes",
+        ".zcode" => "zcode",
         _ => return None,
     })
 }

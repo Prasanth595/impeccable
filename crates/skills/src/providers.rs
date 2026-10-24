@@ -9,7 +9,7 @@ pub const API_BASE: &str = "https://impeccable.style";
 
 pub const PROVIDER_DIRS: &[&str] = &[
     ".claude", ".cursor", ".dsh", ".gemini", ".agents", ".agent", ".github", ".grok", ".hermes", ".kiro",
-    ".opencode", ".pi", ".omp", ".qoder", ".trae", ".trae-cn", ".rovodev", ".vibe",
+    ".opencode", ".pi", ".omp", ".qoder", ".trae", ".trae-cn", ".rovodev", ".vibe", ".zcode",
 ];
 
 const PROVIDER_ALIASES: &[(&str, &str)] = &[
@@ -41,6 +41,7 @@ const PROVIDER_ALIASES: &[(&str, &str)] = &[
     ("trae", ".trae"),
     ("trae-cn", ".trae-cn"),
     ("vibe", ".vibe"),
+    ("zcode", ".zcode"),
 ];
 
 const PROVIDER_DISPLAY: &[(&str, &str, &str)] = &[
@@ -62,11 +63,12 @@ const PROVIDER_DISPLAY: &[(&str, &str, &str)] = &[
     (".trae", "Trae", "trae"),
     (".trae-cn", "Trae CN", "trae-cn"),
     (".vibe", "Mistral Vibe", "vibe"),
+    (".zcode", "ZCode", "zcode"),
 ];
 
 pub const PROVIDER_INPUT_ORDER: &[&str] = &[
     "antigravity", "claude", "codex", "cursor", "dsh", "gemini", "github", "grok", "hermes", "kiro",
-    "opencode", "pi", "omp", "qoder", "trae", "trae-cn", "rovo-dev", "vibe",
+    "opencode", "pi", "omp", "qoder", "trae", "trae-cn", "rovo-dev", "vibe", "zcode",
 ];
 
 pub const DEFAULT_TARGETS: &[&str] = &[".claude", ".agents"];
@@ -485,6 +487,7 @@ const GLOBAL_HARNESS_HINTS: &[Hint] = &[
     Hint::Home(".qoder", ".qoder"),
     Hint::Home(".rovodev", ".rovodev"),
     Hint::Home(".vibe", ".vibe"),
+    Hint::Home(".zcode", ".zcode"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -798,6 +801,15 @@ mod tests {
         let (p, invalid) = parse_provider_list("claude, codex,claude,zzz");
         assert_eq!(p, vec![".claude", ".agents"]);
         assert_eq!(invalid, vec!["zzz"]);
+    }
+
+    #[test]
+    fn zcode_provider_resolves() {
+        assert_eq!(normalize_provider_name("zcode"), Some(".zcode"));
+        assert_eq!(normalize_provider_name(".zcode"), Some(".zcode"));
+        assert_eq!(normalize_provider_name("ZCode"), Some(".zcode"));
+        assert_eq!(provider_display_name(".zcode"), "ZCode");
+        assert_eq!(provider_input_name(".zcode"), "zcode");
     }
 
     #[test]
