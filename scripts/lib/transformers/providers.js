@@ -212,4 +212,19 @@ export const PROVIDERS = {
     // no writeOpenAIMetadata. See hermes-agent/SKILL.md "Skills" section.
     frontmatterFields: ['license', 'compatibility', 'metadata'],
   },
+  zcode: {
+    provider: 'zcode',
+    providerTags: ['zcode'],
+    configDir: '.zcode',
+    displayName: 'ZCode',
+    // ZCode reads the Agent Skills spec subset: `name` and `description` are
+    // required (a description over 1024 chars drops the skill), and `license`
+    // plus `metadata` are preserved. Its frontmatter parser reads only flat
+    // top-level `key: value` lines (indented keys are ignored), and unknown
+    // fields are silently ignored. No hook or subagent emission: ZCode has a
+    // config-driven hook surface (.zcode/config.json `hooks`, off by default)
+    // that is not targeted yet.
+    // See https://zcode.z.ai/en/docs/skill.
+    frontmatterFields: ['license', 'metadata'],
+  },
 };
