@@ -9,11 +9,12 @@
 //! (`customPropMap` is `null`, `overrides` is `null`).
 
 use super::checks_shim::CustomProps;
+use super::shorthand::{background_paint_parts, expand_shorthand_slot, names_background_geometry};
 use super::{
-    apply_static_declaration, collect_static_css_rules, compare_static_priority,
-    is_static_inherited_prop, make_default_style, normalize_static_css_value,
-    parse_static_style_attribute, static_default_style, CssRule, DeclMeta, SpecifiedDecl,
-    SpecifiedStore, StyleValues, STATIC_DEFAULT_STYLE,
+    apply_static_declaration, collect_static_css_rules, collect_static_css_rules_from,
+    compare_static_priority, is_static_inherited_prop, make_default_style,
+    normalize_static_css_value, parse_static_style_attribute, static_default_style, CssRule,
+    DeclMeta, SpecifiedDecl, SpecifiedStore, StyleValues, UrlBase, STATIC_DEFAULT_STYLE,
 };
 use crate::dom::StaticDocument;
 use crate::profile::{self, Meta, ProfileSink};
@@ -39,8 +40,15 @@ static REMOTE_HREF_RE: Lazy<Regex> =
 /// Cache-busting (styles.css?v=3) and root-relative (/static/app.css) hrefs
 /// must not resolve as OS-absolute paths; otherwise the whole stylesheet is
 /// invisible to every element-level check.
-fn resolve_linked_css_path(file_dir: &str, href: &str) -> String {
+pub(crate) fn resolve_linked_css_path(file_dir: &str, href: &str) -> String {
     let stripped = href.split(['?', '#']).next().unwrap_or("");
+    resolve_css_path_exact(file_dir, stripped)
+}
+
+/// [`resolve_linked_css_path`] for a path with no query or fragment left to
+/// cut: an image url's path after its `%XX` escapes are decoded, where a
+/// `#` or `?` is part of the file name (#560).
+pub(crate) fn resolve_css_path_exact(file_dir: &str, stripped: &str) -> String {
     let root_relative = stripped.starts_with('/') && !stripped.starts_with("//");
     if !root_relative {
         return jsp::resolve("/", &[file_dir, stripped]);
@@ -85,15 +93,76 @@ fn resolve_linked_css_path(file_dir: &str, href: &str) -> String {
     jsp::join(&[file_dir, &rel])
 }
 
+/// A page's CSS as the cascade reads it: the text of every `<style>` element
+/// and every local linked stylesheet, joined with `\n`, plus where each
+/// stylesheet linked from another directory sits in that text. The text is
+/// never rewritten, so the pattern checks read every sheet as authored; only
+/// the rules collected from a foreign sheet resolve their urls against it.
+#[derive(Debug, Clone, Default)]
+pub struct StaticCss {
+    pub text: String,
+    page_dir: String,
+    foreign_sheets: Vec<ForeignSheet>,
+}
+
+#[derive(Debug, Clone)]
+struct ForeignSheet {
+    start: usize,
+    end: usize,
+    dir: String,
+}
+
+impl StaticCss {
+    /// The rules of the whole text in cascade order. With no foreign sheet
+    /// this is one parse of the joined text, exactly as before; a foreign
+    /// sheet is parsed on its own so its urls can be told apart, and the
+    /// order numbers run on across the stretches.
+    pub fn rules(&self) -> Vec<CssRule> {
+        if self.foreign_sheets.is_empty() {
+            return collect_static_css_rules(&self.text);
+        }
+        let mut rules: Vec<CssRule> = Vec::new();
+        let mut cursor = 0usize;
+        for sheet in &self.foreign_sheets {
+            if sheet.start > cursor {
+                let stretch = &self.text[cursor..sheet.start];
+                rules.extend(collect_static_css_rules_from(
+                    stretch,
+                    rules.len() as i64,
+                    None,
+                ));
+            }
+            let base = UrlBase::new(&sheet.dir, &self.page_dir);
+            let stretch = &self.text[sheet.start..sheet.end];
+            rules.extend(collect_static_css_rules_from(
+                stretch,
+                rules.len() as i64,
+                Some(&base),
+            ));
+            cursor = sheet.end;
+        }
+        if cursor < self.text.len() {
+            let stretch = &self.text[cursor..];
+            rules.extend(collect_static_css_rules_from(
+                stretch,
+                rules.len() as i64,
+                None,
+            ));
+        }
+        rules
+    }
+}
+
 /// JS: css-cascade.mjs#collectStaticCssText(root, fileDir, profile, filePath, modules)
 /// The text of every `<style>` element plus every local `<link rel=stylesheet>`
 /// resolved relative to `file_dir` (query/hash stripped), joined with `\n`.
 /// `warn` receives the JS `process.stderr.write` notice for an unreadable
 /// linked stylesheet (once per resolved path per scan).
 ///
-/// Returns that text plus a second one for the page-level pattern scan: the
-/// same join minus the linked sheets `ignored` accepts (given the resolved
-/// path). The cascade keeps the full text.
+/// Returns that text, as the cascade's [`StaticCss`], plus a second one for
+/// the page-level pattern scan: the same join minus the linked sheets
+/// `ignored` accepts (given the resolved path). The cascade keeps the full
+/// text.
 pub fn collect_static_css_text(
     doc: &StaticDocument,
     file_dir: &Path,
@@ -101,17 +170,37 @@ pub fn collect_static_css_text(
     file_path: &str,
     warn: Option<&dyn Fn(&str)>,
     ignored: Option<&dyn Fn(&str) -> bool>,
-) -> (String, String) {
-    let mut style_texts: Vec<String> = Vec::new();
+) -> (StaticCss, String) {
+    let file_dir_str = file_dir.to_string_lossy().into_owned();
+    let mut css = StaticCss {
+        page_dir: file_dir_str.clone(),
+        ..StaticCss::default()
+    };
     let mut pattern_texts: Vec<String> = Vec::new();
+    let mut pieces = 0usize;
+    // `style_texts.join('\n')`, built in place so a sheet's span is known.
+    let mut push = |css: &mut StaticCss, piece: &str, foreign_dir: Option<String>| {
+        if pieces > 0 {
+            css.text.push('\n');
+        }
+        pieces += 1;
+        let start = css.text.len();
+        css.text.push_str(piece);
+        if let Some(dir) = foreign_dir {
+            css.foreign_sheets.push(ForeignSheet {
+                start,
+                end: css.text.len(),
+                dir,
+            });
+        }
+    };
     let mut warned_missing_stylesheets: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for style_el in doc.query_selector_all("style") {
         let text = style_el.text_content();
-        pattern_texts.push(text.clone());
-        style_texts.push(text);
+        push(&mut css, &text, None);
+        pattern_texts.push(text);
     }
-    let file_dir_str = file_dir.to_string_lossy().into_owned();
     for link in doc.query_selector_all("link") {
         let rel = link.get_attribute("rel").unwrap_or("");
         let href = link.get_attribute("href").unwrap_or("");
@@ -126,11 +215,13 @@ pub fn collect_static_css_text(
         );
         match read {
             Ok(bytes) => {
+                let sheet_dir = jsp::dirname(&css_path);
+                let foreign_dir = (sheet_dir != file_dir_str).then_some(sheet_dir);
                 let text = String::from_utf8_lossy(&bytes).into_owned();
+                push(&mut css, &text, foreign_dir);
                 if !ignored.is_some_and(|f| f(&css_path)) {
-                    pattern_texts.push(text.clone());
+                    pattern_texts.push(text);
                 }
-                style_texts.push(text);
             }
             Err(_) => {
                 if warned_missing_stylesheets.insert(css_path.clone()) {
@@ -143,9 +234,11 @@ pub fn collect_static_css_text(
             }
         }
     }
-    (style_texts.join("\n"), pattern_texts.join("\n"))
+    (css, pattern_texts.join("\n"))
 }
 
+static PSEUDO_AFTER_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)::?after\s*$").expect("PSEUDO_AFTER_RE"));
 static PSEUDO_RULE_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(&format!(
         r"(?i)^(.+?){ws}*::?(?:before|after)$",
@@ -186,25 +279,83 @@ static ZERO_LEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^0(?:px)?$").expect(
 static WS_SPLIT_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(&format!("{}+", js::WS)).expect("WS_SPLIT_RE"));
 static GRADIENT_RE: Lazy<Regex> = Lazy::new(|| Regex::new("(?i)gradient").expect("GRADIENT_RE"));
+// What a `background-image` value, or the image part of a `background`
+// shorthand, paints on its own: a gradient, a `url()`, another image
+// function, or a value still holding a `var()` the engine cannot read.
+static IMAGE_PAINT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)gradient\(|url\(|image-set\(|image\(|cross-fade\(|element\(|paint\(|var\(")
+        .expect("IMAGE_PAINT_RE")
+});
 
 fn resolve_root(raw: &str, root: &impeccable_core::checks::css_scan::CustomProps) -> String {
     let lookup = |name: &str| root.get(name).cloned();
     measures::resolve_var_refs(raw, &lookup, 0)
 }
 
-/// The `::before` / `::after` rule pre-pass: mark base-selector matches whose
-/// pseudo paints a short chromatic dash (`setAccentDashPseudo`) or a
-/// full-cover opaque surface (`setPseudoSurface`).
-fn mark_pseudo_rule(
+/// The four sides an `inset` shorthand sets, top, right, bottom, left, as
+/// CSS reads one to four values. Anything else (nothing, or more than four
+/// values) is handed to every side as it came, which no side reads as zero.
+fn inset_sides(value: &str) -> [String; 4] {
+    let raw = js::trim(value);
+    let parts: Vec<&str> = if raw.is_empty() {
+        Vec::new()
+    } else {
+        WS_SPLIT_RE.split(raw).collect()
+    };
+    let s = |i: usize| parts[i].to_string();
+    match parts.len() {
+        1 => [s(0), s(0), s(0), s(0)],
+        2 => [s(0), s(1), s(0), s(1)],
+        3 => [s(0), s(1), s(2), s(1)],
+        4 => [s(0), s(1), s(2), s(3)],
+        _ => [raw.to_string(), raw.to_string(), raw.to_string(), raw.to_string()],
+    }
+}
+
+const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
+
+/// The declarations of one `::before` / `::after` rule, by lowercased
+/// property, with `inset` expanded to its four sides in declaration order
+/// so a side named later wins, as it does in CSS.
+fn pseudo_decls(rule: &CssRule) -> IndexMap<String, String> {
+    let mut decls: IndexMap<String, String> = IndexMap::new();
+    for d in &rule.declarations {
+        let key = js::to_lower_case(&d.prop);
+        if key == "inset" {
+            for (side, value) in SIDES.iter().zip(inset_sides(&d.value)) {
+                decls.insert(side.to_string(), value);
+            }
+        }
+        decls.insert(key, d.value.clone());
+    }
+    decls
+}
+
+/// Whether a pseudo with these declarations is stretched over its element:
+/// positioned, and at zero on every side (`inset` having been expanded into
+/// the sides) or 100% by 100%.
+fn pseudo_covers_box(decls: &IndexMap<String, String>) -> bool {
+    let get = |k: &str| decls.get(k).map(|s| s.as_str());
+    let pseudo_pos = js::to_lower_case(get("position").unwrap_or(""));
+    if pseudo_pos != "absolute" && pseudo_pos != "fixed" {
+        return false;
+    }
+    let zero_len = |v: Option<&str>| v.is_some_and(|s| ZERO_LEN_RE.is_match(js::trim(s)));
+    SIDES.iter().all(|side| zero_len(get(side)))
+        || (js::trim(get("width").unwrap_or("")) == "100%"
+            && js::trim(get("height").unwrap_or("")) == "100%")
+}
+
+/// The `::before` / `::after` rule pre-pass as the JS read it, one rule at
+/// a time: mark base-selector matches whose pseudo paints a short chromatic
+/// dash (`setAccentDashPseudo`) or a full-cover opaque surface
+/// (`setPseudoSurface`).
+fn mark_pseudo_analytic(
     doc: &mut StaticDocument,
-    rule: &CssRule,
+    decls: &IndexMap<String, String>,
     base_selector: &str,
     root_custom_props: &impeccable_core::checks::css_scan::CustomProps,
 ) {
-    let mut decls: IndexMap<String, String> = IndexMap::new();
-    for d in &rule.declarations {
-        decls.insert(js::to_lower_case(&d.prop), d.value.clone());
-    }
     let get = |k: &str| decls.get(k).map(|s| s.as_str());
     let first_of = |a: &str, b: &str| -> String {
         match get(a) {
@@ -244,85 +395,251 @@ fn mark_pseudo_rule(
             }
         }
     }
-    let pseudo_pos = js::to_lower_case(get("position").unwrap_or(""));
-    if pseudo_pos == "absolute" || pseudo_pos == "fixed" {
-        let zero_len = |v: Option<&str>| v.is_some_and(|s| ZERO_LEN_RE.is_match(js::trim(s)));
-        let inset_raw = js::trim(get("inset").unwrap_or(""));
-        let covers_box = (!inset_raw.is_empty()
-            && WS_SPLIT_RE
-                .split(inset_raw)
-                .all(|t| ZERO_LEN_RE.is_match(t)))
-            || ["top", "right", "bottom", "left"]
-                .iter()
-                .all(|side| zero_len(get(side)))
-            || (js::trim(get("width").unwrap_or("")) == "100%"
-                && js::trim(get("height").unwrap_or("")) == "100%");
-        // A pseudo stretched over its element and painting a raster image is a
-        // picture under that element's content: the hero photo written as
-        // `.hero::before { position: absolute; inset: 0; background: url() }`.
-        // The contrast pass stands down over it, as it does over an `<img>`.
-        if covers_box
-            && decls.contains_key("content")
-            && js::to_lower_case(&first_of("background-image", "background")).contains("url(")
-        {
-            let ids: Vec<NodeId> = doc
-                .query_selector_all(base_selector)
-                .iter()
-                .map(|e| e.id())
-                .collect();
-            for id in ids {
-                doc.set_pseudo_picture(id);
-            }
-        }
-        if covers_box && decls.contains_key("content") {
-            let surf_raw = resolve_root(
-                &first_of("background-color", "background"),
-                root_custom_props,
-            );
-            let token = COLOR_TOKEN_RE
-                .find(&surf_raw)
-                .map(|m| m.as_str().to_string());
-            let surf = parse_any_color(Some(token.as_deref().unwrap_or(&surf_raw)));
-            if let Some(surf) = surf {
-                if surf.alpha_or_one() >= 0.9 && !GRADIENT_RE.is_match(&surf_raw) {
-                    let ids: Vec<NodeId> = doc
-                        .query_selector_all(base_selector)
-                        .iter()
-                        .map(|e| e.id())
-                        .collect();
-                    for id in ids {
-                        doc.set_pseudo_surface(id, surf);
-                    }
+    if pseudo_covers_box(decls) && decls.contains_key("content") {
+        let surf_raw = resolve_root(
+            &first_of("background-color", "background"),
+            root_custom_props,
+        );
+        let token = COLOR_TOKEN_RE
+            .find(&surf_raw)
+            .map(|m| m.as_str().to_string());
+        let surf = parse_any_color(Some(token.as_deref().unwrap_or(&surf_raw)));
+        if let Some(surf) = surf {
+            if surf.alpha_or_one() >= 0.9 && !GRADIENT_RE.is_match(&surf_raw) {
+                let ids: Vec<NodeId> = doc
+                    .query_selector_all(base_selector)
+                    .iter()
+                    .map(|e| e.id())
+                    .collect();
+                for id in ids {
+                    doc.set_pseudo_surface(id, surf);
                 }
             }
         }
     }
 }
 
+/// One winner into a merged pseudo map, by the cascade's priority (a later
+/// declaration of equal priority wins, as within one rule).
+fn put_pseudo_decl(
+    map: &mut IndexMap<String, (String, DeclMeta)>,
+    key: &str,
+    value: &str,
+    meta: &DeclMeta,
+) {
+    if compare_static_priority(map.get(key).map(|(_, m)| m), meta) {
+        map.insert(key.to_string(), (value.to_string(), meta.clone()));
+    }
+}
+
+/// One declaration of a rule into a merged pseudo map. A `background`
+/// shorthand also takes the `background-color` and `background-image`
+/// keys, with the color and the image list it names
+/// (`background_paint_parts`: `transparent` and `none` where it names
+/// neither), since it resets both longhands: a longhand declared before it
+/// loses its slot, one declared after it wins the slot back, and the
+/// readers below prefer the longhand key. `inset` takes the four side keys
+/// the same way. Winners already expanded this way merge key by key
+/// (`put_pseudo_decl`), never through here again: a replay would hand a
+/// longhand's slot back to a shorthand of the same priority that it had
+/// already beaten. The shorthand is resolved against the root's custom
+/// properties before it is split, so `var(--scrim)` holding a gradient
+/// lands in the image slot alone.
+fn merge_pseudo_decl(
+    map: &mut IndexMap<String, (String, DeclMeta)>,
+    key: &str,
+    value: &str,
+    meta: &DeclMeta,
+    root_custom_props: &impeccable_core::checks::css_scan::CustomProps,
+) {
+    put_pseudo_decl(map, key, value, meta);
+    if key == "background" {
+        // Resolved first, so a `var()` holding a gradient or a color reads
+        // as that and not as one unreadable value in both slots.
+        let (color, image) = background_paint_parts(&resolve_root(value, root_custom_props));
+        put_pseudo_decl(map, "background-color", &color, meta);
+        put_pseudo_decl(map, "background-image", &image, meta);
+    } else if key == "inset" {
+        for (side, side_value) in SIDES.iter().zip(inset_sides(value)) {
+            put_pseudo_decl(map, side, &side_value, meta);
+        }
+    }
+}
+
+/// A `content` value that generates no box: `none`, or `normal`, which
+/// computes to `none` on `::before` and `::after`.
+fn content_generates_no_box(value: &str) -> bool {
+    let value = js::to_lower_case(js::trim(value));
+    value == "none" || value == "normal"
+}
+
+/// Whether a pseudo with these declarations generates a box that paints:
+/// a `content` other than `none` or `normal` (a value the engine cannot
+/// read is taken to generate one), no `display: none` or `visibility:
+/// hidden`, and an opacity above 0.02 (one the engine cannot read is taken
+/// to paint).
+fn pseudo_paints_a_box(decls: &IndexMap<String, String>) -> bool {
+    let get = |k: &str| decls.get(k).map(|s| js::to_lower_case(js::trim(s)));
+    let Some(content) = get("content") else {
+        return false;
+    };
+    if content_generates_no_box(&content)
+        || get("display").as_deref() == Some("none")
+        || get("visibility").as_deref() == Some("hidden")
+    {
+        return false;
+    }
+    match get("opacity") {
+        Some(opacity) => {
+            let value = js::parse_float(&opacity);
+            value.is_nan() || value > 0.02
+        }
+        None => true,
+    }
+}
+
+/// Whether a `::before` / `::after` rule names the geometry, the paint, or
+/// the box's visibility the merged read below needs, so its matches are
+/// worth looking up over the document. A rule naming only `content` (an
+/// icon font's, by the thousand) cannot complete an overlay on its own; it
+/// is matched against the elements those rules found instead, since one
+/// that turns the box on or off from another selector must reach the
+/// merge too.
+fn names_pseudo_paint_or_geometry(decls: &IndexMap<String, (String, DeclMeta)>) -> bool {
+    [
+        "position",
+        "inset",
+        "top",
+        "right",
+        "bottom",
+        "left",
+        "width",
+        "height",
+        "background",
+        "background-color",
+        "background-image",
+        "display",
+        "visibility",
+        "opacity",
+    ]
+    .iter()
+    .any(|key| decls.contains_key(*key))
+}
+
+/// The sampled path's marks (#560) on a pseudo stretched over its element
+/// that generates a box which paints (`pseudo_paints_a_box`): a raster
+/// image makes it a picture under the element's content, and any paint at
+/// all makes it an overlay the walk gives up on. Read from the
+/// winning declarations of every rule on the same pseudo of the element
+/// (`build_static_style_map`), not rule by rule: the geometry and the paint
+/// may come from different rules, on one selector or two, and a later rule
+/// may take the paint away.
+fn mark_pseudo_paint(
+    doc: &mut StaticDocument,
+    decls: &IndexMap<String, String>,
+    ids: &[NodeId],
+    root_custom_props: &impeccable_core::checks::css_scan::CustomProps,
+) {
+    if !pseudo_covers_box(decls) || !pseudo_paints_a_box(decls) {
+        return;
+    }
+    let get = |k: &str| decls.get(k).map(|s| s.as_str());
+    let first_of = |a: &str, b: &str| -> String {
+        match get(a) {
+            Some(v) if !v.is_empty() => v.to_string(),
+            _ => get(b).unwrap_or("").to_string(),
+        }
+    };
+    // A pseudo stretched over its element and painting a raster image is a
+    // picture under that element's content: the hero photo written as
+    // `.hero::before { position: absolute; inset: 0; background: url() }`.
+    // The contrast pass stands down over it, as it does over an `<img>`.
+    let image_raw = resolve_root(
+        &first_of("background-image", "background"),
+        root_custom_props,
+    );
+    let picture = js::to_lower_case(&image_raw).contains("url(");
+    let color_raw = resolve_root(
+        &first_of("background-color", "background"),
+        root_custom_props,
+    );
+    let token = COLOR_TOKEN_RE
+        .find(&color_raw)
+        .map(|m| m.as_str().to_string());
+    let color = parse_any_color(Some(token.as_deref().unwrap_or(&color_raw)));
+    // Anything the pseudo paints over the box, however faint, sits between
+    // the box's own image and its text (#560). Of the color, only nothing,
+    // `none`, `transparent` (which no color parser reads), and a color too
+    // faint to see are known not to paint, and a value the engine cannot
+    // read counts as paint; the image part paints on its own terms, whatever
+    // a later longhand did to the color.
+    let color_no_paint = color_raw.is_empty()
+        || color_raw.eq_ignore_ascii_case("none")
+        || color_raw.eq_ignore_ascii_case("transparent")
+        || color.is_some_and(|c| c.alpha_or_one() <= 0.02);
+    let paints = !color_no_paint || IMAGE_PAINT_RE.is_match(&image_raw);
+    for id in ids {
+        if picture {
+            doc.set_pseudo_picture(*id);
+        }
+        if paints {
+            doc.set_pseudo_overlay(*id);
+        }
+    }
+}
+
+/// A `background` shorthand's layer that holds a `var()` is stored whole in
+/// every slot (#560), as `from-shorthand(<its tokens>)`, since the parser
+/// cannot see what the `var()` holds. Resolved, each slot re-reads the
+/// layer with the shorthand grammar and takes what the shorthand named,
+/// the default when it named nothing there (`expand_shorthand_slot`); the
+/// color slot, which the pinned expansion fills with a `var()` standing
+/// before the image, computes as `transparent` when that resolves to
+/// background geometry, so no reader of `backgroundColor` takes a keyword
+/// for an unreadable color. The second value says the `var()` added or
+/// removed layers, which the compute loop records as
+/// `backgroundLayersUnknown` for the walk to give up on.
+fn shorthand_slot_or_default(prop: &str, value: String) -> (String, bool) {
+    match prop {
+        "backgroundColor" if names_background_geometry(&value) => {
+            ("transparent".to_string(), false)
+        }
+        "backgroundRepeat" | "backgroundSize" | "backgroundPosition" | "backgroundOrigin"
+        | "backgroundClip" | "backgroundAttachment" => expand_shorthand_slot(prop, &value),
+        _ => (value, false),
+    }
+}
+
 /// JS: css-cascade.mjs#buildStaticStyleMap(root, staticDoc, cssText, modules, profile, filePath)
 pub fn build_static_style_map(
     doc: &mut StaticDocument,
-    css_text: &str,
+    css: &StaticCss,
     profile: Option<&dyn ProfileSink>,
     file_path: &str,
 ) {
     let mut specified: SpecifiedStore<NodeId> = SpecifiedStore::new();
     let mut hover_specified: SpecifiedStore<NodeId> = SpecifiedStore::new();
     let mut placeholder_specified: SpecifiedStore<NodeId> = SpecifiedStore::new();
-    let root_custom_props = collect_css_custom_props(css_text);
+    let root_custom_props = collect_css_custom_props(&css.text);
     // Selectors of radius rules the matcher refuses: the side-accent gate
     // cannot read their corners, so the elements they may reach stay unknown.
     let mut refused_radius_selectors: Vec<String> = Vec::new();
     let rules = profile::step(
         profile,
         Meta::new("parse-css", "css-rules", file_path),
-        || collect_static_css_rules(css_text),
+        || css.rules(),
     );
 
     profile::step(
         profile,
         Meta::new("selector-match", "css-selectors", file_path),
         || {
+            // The winning declarations of every `::before` / `::after` rule
+            // on one base selector, for the paint read once all are in
+            // (#560): a pseudo's geometry and its paint may be split across
+            // rules, and a later rule may take the paint away.
+            let mut pseudo_merged: IndexMap<(String, bool), IndexMap<String, (String, DeclMeta)>> =
+                IndexMap::new();
             for rule in &rules {
                 let placeholder_host = if rule.is_hover {
                     None
@@ -332,7 +649,24 @@ pub fn build_static_style_map(
                 if !rule.is_hover && placeholder_host.is_none() {
                     if let Some(pm) = PSEUDO_RULE_RE.captures(&rule.selector) {
                         let base = pm.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
-                        mark_pseudo_rule(doc, rule, &base, &root_custom_props);
+                        mark_pseudo_analytic(doc, &pseudo_decls(rule), &base, &root_custom_props);
+                        let after = PSEUDO_AFTER_RE.is_match(&rule.selector);
+                        let merged = pseudo_merged.entry((base, after)).or_default();
+                        for d in &rule.declarations {
+                            let meta = DeclMeta {
+                                important: d.important,
+                                specificity: rule.specificity,
+                                order: rule.order,
+                                inline: false,
+                            };
+                            merge_pseudo_decl(
+                                merged,
+                                &js::to_lower_case(&d.prop),
+                                &d.value,
+                                &meta,
+                                &root_custom_props,
+                            );
+                        }
                         continue;
                     }
                 }
@@ -378,8 +712,10 @@ pub fn build_static_style_map(
                 };
                 for node in matched {
                     for decl in &rule.declarations {
+                        // A `::placeholder` rule contributes its ink alone:
+                        // the color, and the `opacity` that fades it.
                         if placeholder_host.is_some()
-                            && js::to_lower_case(&decl.prop) != "color"
+                            && !matches!(js::to_lower_case(&decl.prop).as_str(), "color" | "opacity")
                         {
                             continue;
                         }
@@ -392,6 +728,61 @@ pub fn build_static_style_map(
                         apply_static_declaration(store, node, &decl.prop, &decl.value, &meta);
                     }
                 }
+            }
+
+            // Then by element: the winners of every selector that names the
+            // pseudo's geometry or paint, merged by the cascade's own
+            // priority, so two selectors matching one element read as one.
+            // The lookup is quiet, as the side-accent probes are: a base
+            // selector the matcher refuses is not a parity record.
+            let mut pseudo_by_node: IndexMap<(NodeId, bool), IndexMap<String, (String, DeclMeta)>> =
+                IndexMap::new();
+            for ((base, after), decls) in &pseudo_merged {
+                if !names_pseudo_paint_or_geometry(decls) {
+                    continue;
+                }
+                let Some(ids) = doc.select_ids_quiet(base) else {
+                    continue;
+                };
+                for id in ids {
+                    let merged = pseudo_by_node.entry((id, *after)).or_default();
+                    for (key, (value, meta)) in decls {
+                        put_pseudo_decl(merged, key, value, meta);
+                    }
+                }
+            }
+            // A rule naming only `content` is matched against those
+            // elements alone, never looked up over the document: one that
+            // turns the box on (`.enabled::before { content: '' }`) or off
+            // from another selector merges where it matches.
+            let candidates: Vec<NodeId> = {
+                let mut ids: Vec<NodeId> = pseudo_by_node.keys().map(|(id, _)| *id).collect();
+                ids.dedup();
+                ids
+            };
+            if !candidates.is_empty() {
+                for ((base, after), decls) in &pseudo_merged {
+                    if names_pseudo_paint_or_geometry(decls) || !decls.contains_key("content") {
+                        continue;
+                    }
+                    let Some(ids) = doc.matching_ids_quiet(base, &candidates) else {
+                        continue;
+                    };
+                    for id in ids {
+                        if let Some(merged) = pseudo_by_node.get_mut(&(id, *after)) {
+                            for (key, (value, meta)) in decls {
+                                put_pseudo_decl(merged, key, value, meta);
+                            }
+                        }
+                    }
+                }
+            }
+            for ((id, _), decls) in &pseudo_by_node {
+                let merged: IndexMap<String, String> = decls
+                    .iter()
+                    .map(|(k, (v, _))| (k.clone(), v.clone()))
+                    .collect();
+                mark_pseudo_paint(doc, &merged, &[*id], &root_custom_props);
             }
 
             let mut inline_order: i64 = rules.len() as i64 + 1;
@@ -426,7 +817,7 @@ pub fn build_static_style_map(
             compute_styles(doc, &specified, &hover_specified, &placeholder_specified);
         },
     );
-    mark_side_accent_radius_blind_spots(doc, css_text, &specified, &refused_radius_selectors);
+    mark_side_accent_radius_blind_spots(doc, &css.text, &specified, &refused_radius_selectors);
 }
 
 /// Whether a property sets a border radius, in CSS or camelCase spelling.
@@ -618,6 +1009,7 @@ fn compute_styles(
         if doc.element(node).is_some_and(|el| matches!(el.tag_lower().as_str(), "em" | "i" | "cite" | "dfn" | "var" | "address")) {
             values.insert("fontStyle".to_string(), "italic".to_string());
         }
+        let mut layers_unknown = false;
         for (prop, decl) in specified_map {
             if prop.starts_with("--") {
                 continue;
@@ -629,9 +1021,13 @@ fn compute_styles(
                 parent_style.as_deref(),
                 Some(&values),
             );
+            let (next, unknown) = shorthand_slot_or_default(prop, next);
+            layers_unknown |= unknown;
             values.insert(prop.clone(), next);
         }
-
+        if layers_unknown {
+            values.insert("backgroundLayersUnknown".to_string(), "1".to_string());
+        }
         // Hover pass: color / backgroundColor only.
         if let Some(hover_map) = hover_specified.get(&node) {
             let mut hover_values: Option<StyleValues> = None;
@@ -650,6 +1046,7 @@ fn compute_styles(
                     parent_style.as_deref(),
                     Some(&values),
                 );
+                let (next, _) = shorthand_slot_or_default(prop, next);
                 if values.get(prop).map(|s| s.as_str()) == Some(next.as_str()) {
                     continue;
                 }
@@ -672,6 +1069,19 @@ fn compute_styles(
                 );
                 let mut ph_style = StyleValues::default();
                 ph_style.insert("color".to_string(), next);
+                // The rule's own `opacity` fades the placeholder's ink
+                // (`::placeholder { opacity: 0 }` hides it); the contrast
+                // checks read it beside the color (#560).
+                if let Some(opacity_decl) = ph_map.get("opacity") {
+                    let next = normalize_static_css_value(
+                        "opacity",
+                        &opacity_decl.value,
+                        &custom_props,
+                        Some(&values),
+                        Some(&values),
+                    );
+                    ph_style.insert("opacity".to_string(), next);
+                }
                 placeholder_out.push((node, ph_style));
             }
         }
