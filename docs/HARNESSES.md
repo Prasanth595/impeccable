@@ -47,7 +47,7 @@ Fields marked with * are spec-standard. Others are provider extensions.
 | `description`* | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | `license`* | Yes | Yes | Ignored | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Ignored | Yes |
 | `compatibility`* | Yes | Yes | Ignored | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Ignored | Ignored |
-| `metadata`* | Yes | Yes | Ignored | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Ignored | Yes |
+| `metadata`* | Yes | Yes | Ignored | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | `allowed-tools`* | Yes | No | Ignored | No | No | Yes | No | No | No | Yes | Yes | Yes | Yes | Yes | No | Ignored |
 | `user-invocable` | Yes | No | No | No | Yes | Yes | No | No | No | No | Yes | Yes | Yes | No | Yes | No |
 | `argument-hint` | Yes | No | No | No | Yes | Yes | No | No | No | No | Yes | Yes | No | No | No | No |
